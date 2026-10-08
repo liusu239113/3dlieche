@@ -18,7 +18,18 @@
       "../assets",
       "../scripts"
     ],
-    "asset_ignores": []
+    "asset_ignores": [
+      "assets/model/6eccf171dd6e441791f3ce61bd40fa33/**",
+      "assets/model/80f9bb3515ea4f64bcfc2de900536c75/**",
+      "assets/model/8171ec0365e941769569318954f384b3/**",
+      "assets/model/93b1cac4ba724bddb92d058ca9f04c2f/**",
+      "assets/model/a85a88cc706247cd97c8e02f1f0f29ba/**",
+      "assets/model/ba150fe5fc9841cda95f7109183c3c47/**",
+      "assets/model/cfcede1b832c45ecb032938cbcea4fa6/**",
+      "assets/model/df89b600ae834a8c8c3210bae64286bc/**",
+      "assets/RollingStockBaked/SaveApiProbe.mdl",
+      "assets/RollingStockBaked/SaveApiProbe.mdl.meta"
+    ]
   },
   "@runtime": {
     "multiplayer": {
@@ -28,8 +39,8 @@
       "match_info": {
         "desc_name": "free_match",
         "immediately_start": false,
-        "match_timeout": 0,
-        "player_number": 1
+        "match_timeout": 30,
+        "player_number": 2
       },
       "persistent_world": {
         "enabled": false

@@ -7,6 +7,7 @@ local Route = require "world.Route"
 local Train = require "train.Train"
 local Hud = require "ui.Hud"
 local AudioManager = require "audio.AudioManager"
+local SpeedPolicy = require "game.SpeedPolicy"
 
 local Game = {}
 
@@ -24,6 +25,8 @@ local dwellTimer_ = 0
 local elapsed_ = 0
 local xp_ = 0
 local overspeedWarned_ = false
+local travelReversing_ = false
+local brakeWarned_ = false
 local switchPos_ = 0.0
 local lastArrival_ = nil
 
@@ -40,7 +43,8 @@ function Game.Init()
     nextIndex_ = 1
     local bestDist = math.huge
     for i, st in ipairs(stations_) do
-        local d = Route.ForwardDistance(s, st.s)
+        local d = Train.IsReversing() and Route.ForwardDistance(st.s, s)
+            or Route.ForwardDistance(s, st.s)
         if d < bestDist then
             bestDist = d
             nextIndex_ = i
@@ -51,6 +55,8 @@ function Game.Init()
     dwellTimer_ = 0
     elapsed_ = 0
     xp_ = 0
+    travelReversing_ = Train.IsReversing()
+    overspeedWarned_, brakeWarned_ = false, false
 
     -- 小地图数据
     local marks = {}
@@ -58,9 +64,12 @@ function Game.Init()
         local pos = Route.Sample(st.s)
         marks[#marks + 1] = { x = pos.x, z = pos.z, active = false }
     end
+    -- 小地图独立低密度采样，线路延长不复制十万米级路线点。
     local samples = {} ---@type CabRouteSample[]
-    for _, point in ipairs(Route.GetPoints()) do
-        samples[#samples + 1] = { pos = point.pos }
+    local count = 360
+    for i = 1, count do
+        local pos = Route.Sample((i - 1) * Route.GetLength() / count)
+        samples[#samples + 1] = { pos = pos }
     end
     Hud.BuildMinimap(samples, marks)
 
@@ -76,6 +85,17 @@ end
 ---@param dt number
 function Game.Update(dt)
     elapsed_ = elapsed_ + dt
+    local reversing = Train.IsReversing()
+    if state_ ~= STATE.DWELL and reversing ~= travelReversing_ then
+        travelReversing_ = reversing
+        local best = math.huge
+        for i, station in ipairs(stations_) do
+            local distance = reversing and Route.ForwardDistance(station.s, Train.GetS())
+                or Route.ForwardDistance(Train.GetS(), station.s)
+            if distance < best then best, nextIndex_ = distance, i end
+        end
+        overspeedWarned_, brakeWarned_ = false, false
+    end
 
     if state_ == STATE.DWELL then
         dwellTimer_ = dwellTimer_ - dt
@@ -141,8 +161,9 @@ function Game.Depart()
     Hud.HideBanner()
 
     -- 下一个站
-    nextIndex_ = nextIndex_ + 1
-    if nextIndex_ > #stations_ then nextIndex_ = 1 end
+    nextIndex_ = (nextIndex_ - 1 + (Train.IsReversing() and -1 or 1)) % #stations_ + 1
+    travelReversing_ = Train.IsReversing()
+    overspeedWarned_, brakeWarned_ = false, false
 
     local nxt = stations_[nextIndex_]
     Hud.SetStationName(stations_[nextIndex_].name)
@@ -154,15 +175,40 @@ end
 -- ---------------------------------------------------------------------------
 -- 限速
 -- ---------------------------------------------------------------------------
+function Game.GetSpeedLimit()
+    local station = stations_[nextIndex_]
+    return SpeedPolicy.Calculate({
+        s = Train.GetS(), length = Route.GetLength(),
+        operatingKmh = Train.GetOperatingSpeedKmh(), lineKmh = G.SpeedLimitKmh,
+        deceleration = Train.GetServiceDeceleration(), reversing = Train.IsReversing(),
+        segments = Route.GetSegments(), stations = stations_,
+        nextStopS = station and station.s or nil, dwelling = state_ == STATE.DWELL,
+        stationKmh = G.StationSpeedKmh, reactionSeconds = G.BrakeReactionSeconds,
+    })
+end
+
 function Game.CheckSpeedLimit()
-    local speed = Train.GetSpeedKmh()
-    if speed > G.SpeedLimitKmh + 5.0 then
+    local speed = math.abs(Train.GetSpeedKmh())
+    local limit, reason = Game.GetSpeedLimit()
+    if speed > limit + 5.0 then
         if not overspeedWarned_ then
             overspeedWarned_ = true
-            Hud.Toast("超速! 请减速至 " .. G.SpeedLimitKmh .. " km/h 以下", 3.0)
+            Hud.Toast(reason .. "限速 " .. limit .. " km/h，请收油制动", 3.0)
         end
     else
         overspeedWarned_ = false
+    end
+    local station = stations_[nextIndex_]
+    if station then
+        local distance = Train.IsReversing() and Route.ForwardDistance(station.s, Train.GetS())
+            or Route.ForwardDistance(Train.GetS(), station.s)
+        local velocity = speed / 3.6
+        local brakingDistance = velocity * velocity / (2 * Train.GetServiceDeceleration())
+            + velocity * G.BrakeReactionSeconds + 100
+        if speed > 30 and distance <= brakingDistance and not brakeWarned_ then
+            brakeWarned_ = true
+            Hud.Toast("准备进站：收油并制动，剩余 " .. math.floor(distance) .. " m", 3)
+        elseif distance > brakingDistance + 200 then brakeWarned_ = false end
     end
 end
 
@@ -174,7 +220,8 @@ function Game.UpdateHud(dt)
     local st = stations_[nextIndex_]
     if st then
         Hud.SetStationName(st.name)
-        local dist = Route.ForwardDistance(Train.GetS(), st.s)
+        local dist = Train.IsReversing() and Route.ForwardDistance(st.s, Train.GetS())
+            or Route.ForwardDistance(Train.GetS(), st.s)
         if state_ == STATE.DWELL then
             Hud.SetNextStation("停靠中")
         else
@@ -186,7 +233,8 @@ function Game.UpdateHud(dt)
         end
     end
 
-    Hud.SetSpeed(Train.GetSpeedKmh(), G.SpeedLimitKmh)
+    Hud.SetSpeedRange(Train.GetMaxSpeedKmh())
+    Hud.SetSpeed(Train.GetSpeedKmh(), Game.GetSpeedLimit())
     Hud.SetReversing(Train.IsReversing())
     Hud.SetThrottle(Train.GetThrottle(), GameConfig.Train.MaxThrottle)
     Hud.SetBrake(Train.GetBrake())

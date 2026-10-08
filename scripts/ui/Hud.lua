@@ -4,6 +4,7 @@ local UI = require "urhox-libs/UI"
 local GameConfig = require "config.GameConfig"
 local Skin = require "ui.CabStyle"
 local Cab = require "ui.CabInstruments"
+local TrainSelector = require "ui.TrainSelector"
 local C = Skin.Colors
 local Hud = {}
 
@@ -19,6 +20,8 @@ local Hud = {}
 ---@field onCamera? fun()
 ---@field onReverse? fun()
 ---@field onSwitch? fun(dir: number) Retained; no fake turnout UI on a single-line loop
+---@field onSelectTrain? fun(id: string): boolean, string? Main owns authoritative selection
+---@field onOpenTrainSelector? fun(open: boolean) Main owns pause/restore and gameplay input gating
 ---@type CabHudCallbacks
 local callbacks_ = {}
 
@@ -48,12 +51,16 @@ local callbacks_ = {}
 ---@field bannerSub? Label
 ---@field toast? CabPanel
 ---@field toastText? Label
+---@field trainBar? CabPanel
+---@field trainName? Label
+---@field trainSelector? CabTrainSelector
 ---@type CabHudRefs
 local refs_ = {}
 
 local state_ = {
     speed = 0.0,
     limit = GameConfig.Gameplay.SpeedLimitKmh,
+    instrumentMax = 400,
     notch = 0,
     maxNotch = GameConfig.Train.MaxThrottle,
     brake = 0.0,
@@ -67,7 +74,11 @@ local state_ = {
     switch = 0.0,
     mapVisible = false,
     toastTime = 0.0,
+    selectedTrainId = "",
+    selectedTrainName = "待同步车型",
 }
+---@type CabTrainCatalogEntry[]
+local trainCatalog_ = {}
 ---@type CabMapPoint[]
 local mapPoints_ = {}
 ---@type CabMapStation[]
@@ -77,6 +88,8 @@ local mapTrain_ = { x = 0.0, z = 0.0 }
 local activeStation_ = nil
 local lastLayout_ = ""
 local lastStatus_ = ""
+-- 使用专用暂停同步接口后，Toast 文案不再参与暂停状态管理。
+local explicitPause_ = false
 
 ---@param value number|string|nil
 ---@param fallback number
@@ -201,6 +214,9 @@ local function LayoutHud()
         left = left, width = math.min(370, w - (narrow and 0 or 190)) }) end
     if refs_.toast then refs_.toast:SetStyle({ top = narrow and top + 174 or top + 119,
         left = left, width = math.min(370, w - (narrow and 0 or 190)) }) end
+    if refs_.trainBar then refs_.trainBar:SetStyle({ left = left, bottom = bottom + (small and 0 or 30) + 72,
+        width = math.min(290, math.max(0, w - deskWidth - (narrow and 16 or meterSize + 26))), height = 44 }) end
+    if refs_.trainSelector then refs_.trainSelector:SetBounds(left, top, w, h) end
     print(string.format("[Hud] 驾驶仪表 %.0fx%.0f base px, %s", vw, vh, narrow and "窄屏布局" or "横屏布局"))
 end
 
@@ -219,10 +235,12 @@ end
 
 ---@param cbs CabHudCallbacks?
 function Hud.Init(cbs)
+    if refs_.trainSelector then refs_.trainSelector:Close() end
     callbacks_ = cbs or {}
     state_.limit = Number(GameConfig.Gameplay.SpeedLimitKmh, 80)
     if state_.limit <= 0 then state_.limit = 80 end
     state_.paused = false
+    explicitPause_ = false
     state_.mapVisible = false
     state_.toastTime = 0
     UI.Init({ theme = Skin.CreateTheme(), scale = UI.Scale.DEFAULT })
@@ -232,6 +250,7 @@ end
 
 --- 保留重建 API；重建前安全释放按住的制动手柄。
 function Hud.BuildRoot()
+    if refs_.trainSelector then refs_.trainSelector:Close() end
     if refs_.brake then refs_.brake:ReleaseHold() end
     refs_ = {}
     lastLayout_, lastStatus_ = "", ""
@@ -273,7 +292,7 @@ function Hud.BuildRoot()
             pause,
         } }
     local meter = Cab.Speedometer { id = "speedInstrument", position = "absolute",
-        maxSpeed = GameConfig.Train.MaxSpeedKmh, limit = state_.limit }
+        maxSpeed = state_.instrumentMax, limit = state_.limit }
     meter:SetReading(state_.speed, state_.limit)
     local throttle = Cab.Lever { id = "throttleHandle", kind = "throttle", onSelect = SelectThrottle }
     throttle:SetNotch(state_.notch, state_.maxNotch)
@@ -285,9 +304,9 @@ function Hud.BuildRoot()
                 UI.Panel { width = 40, gap = 6, justifyContent = "center",
                     alignSelf = "stretch",
                     pointerEvents = "box-none", children = {
-                        Cab.Key { icon = "up", hint = "W", width = 40, height = 44,
+                        Cab.Key { id = "throttleUp", icon = "up", hint = "W", width = 40, height = 44,
                             onClick = function() if callbacks_.onThrottleUp then callbacks_.onThrottleUp() end end },
-                        Cab.Key { icon = "down", hint = "S", width = 40, height = 44,
+                        Cab.Key { id = "throttleDown", icon = "down", hint = "S", width = 40, height = 44,
                             onClick = function() if callbacks_.onThrottleDown then callbacks_.onThrottleDown() end end },
                     } },
                 throttle, brake,
@@ -295,7 +314,7 @@ function Hud.BuildRoot()
             UI.Panel { flexDirection = "row", alignItems = "center", justifyContent = "space-between",
                 height = 42, pointerEvents = "box-none", children = {
                     Label { text = "按住制动", fontSize = 8.5, fontColor = C.muted },
-                    Cab.Key { text = "缓解", hint = "释放制动力", width = 76, height = 42,
+                    Cab.Key { id = "releaseBrake", text = "缓解", hint = "释放制动力", width = 76, height = 42,
                         onClick = function()
                             if refs_.brake then refs_.brake:ReleaseHold() end
                             if callbacks_.onReleaseBrake then callbacks_.onReleaseBrake()
@@ -330,16 +349,50 @@ function Hud.BuildRoot()
     local toast = Cab.Panel { position = "absolute", minHeight = 34, maxHeight = 52,
         paddingHorizontal = 12, paddingVertical = 7, pointerEvents = "none", visible = false,
         children = { toastText } }
+    local trainName = Label { id = "selectedTrainName", text = state_.selectedTrainName,
+        fontSize = 10.5, fontWeight = "bold", minWidth = 0, flexGrow = 1, flexShrink = 1 }
+    local trainBar = Cab.Panel { id = "trainModelBar", position = "absolute", width = 290, height = 44,
+        flexDirection = "row", alignItems = "center", paddingLeft = 10, gap = 8,
+        pointerEvents = "box-none", children = {
+            trainName,
+            UI.Button { id = "openTrainSelector", text = "车型", width = 64, height = 44,
+                variant = "secondary", onClick = function() Hud.SetTrainSelectorOpen(true) end },
+        } }
+    local selector = TrainSelector { id = "trainSelector" }
+    selector:SetCallbacks({
+        onSelect = callbacks_.onSelectTrain and function(id)
+            local success, message = callbacks_.onSelectTrain(id)
+            if success == true then
+                -- main 可在回调内同步真实选择；未同步时从已注入的目录补齐名称。
+                if state_.selectedTrainId ~= id then
+                    local entry = selector:FindTrain(id)
+                    Hud.SetSelectedTrain(id, entry and entry.name or id)
+                end
+                Hud.Toast(message or "车型已切换", 2)
+            end
+            return success, message
+        end or nil,
+        onOpen = function(open)
+            if callbacks_.onOpenTrainSelector then callbacks_.onOpenTrainSelector(open) end
+        end,
+    })
+    selector:SetCatalog(trainCatalog_)
+    selector:SetSelected(state_.selectedTrainId, state_.selectedTrainName)
+    selector:SetOperatingState(state_.speed, state_.limit)
     local root = HudRoot { id = "hudRoot", width = "100%", height = "100%",
-        pointerEvents = "box-none", children = { info, actions, meter, desk, left, map, banner, toast } }
+        pointerEvents = "box-none", children = { info, actions, meter, desk, left, map, banner, toast,
+            trainBar, selector } }
     refs_ = {
         root = root, info = info, actions = actions, station = station, distance = distance,
         clock = clock, xp = xp, extras = extras, status = status, statusLamp = statusLamp,
         meter = meter, desk = desk, throttle = throttle, brake = brake, reverse = reverse,
         pause = pause, mapKey = mapKey, map = map, left = left, hint = hint,
         banner = banner, bannerTitle = bannerTitle, bannerSub = bannerSub, toast = toast, toastText = toastText,
+        trainBar = trainBar, trainName = trainName, trainSelector = selector,
     }
     UI.SetRoot(root, true)
+    -- 检查挂载与真实 ID，避免只有 refs 可用、按钮树却漏挂选择器。
+    assert(root:FindById("trainSelector") == selector, "车型选择器未正确挂载到 HUD")
     LayoutHud()
     RefreshStatus()
 end
@@ -358,11 +411,18 @@ function Hud.SetStationName(name)
     state_.station = name or "下一站"
     Text(refs_.station, state_.station)
 end
+---@param maximum number
+function Hud.SetSpeedRange(maximum)
+    state_.instrumentMax = math.max(40, math.ceil(Number(maximum, 400) / 20) * 20)
+    if refs_.meter then refs_.meter:SetRange(state_.instrumentMax) end
+end
+
 ---@param kmh number|string|nil
 function Hud.SetLimit(kmh)
     local value = Number(kmh, GameConfig.Gameplay.SpeedLimitKmh)
-    state_.limit = value > 0 and value or GameConfig.Gameplay.SpeedLimitKmh
+    state_.limit = value >= 0 and value or GameConfig.Gameplay.SpeedLimitKmh
     if refs_.meter then refs_.meter:SetReading(state_.speed, state_.limit) end
+    if refs_.trainSelector then refs_.trainSelector:SetOperatingState(state_.speed, state_.limit) end
     RefreshStatus()
 end
 ---@param kmh number
@@ -371,6 +431,7 @@ function Hud.SetSpeed(kmh, limit)
     state_.speed = Number(kmh, 0)
     if limit ~= nil then Hud.SetLimit(limit) end
     if refs_.meter then refs_.meter:SetReading(state_.speed, state_.limit) end
+    if refs_.trainSelector then refs_.trainSelector:SetOperatingState(state_.speed, state_.limit) end
     RefreshStatus()
 end
 ---@param seconds number
@@ -418,17 +479,29 @@ end
 function Hud.HideBanner()
     if refs_.banner then refs_.banner:Hide() end
 end
+--- main 同步有效暂停（用户暂停 OR 车型选择器开启），此后不再解析 Toast 文案。
+---@param paused boolean
+function Hud.SetPaused(paused)
+    explicitPause_ = true
+    state_.paused = paused == true
+    if state_.paused and refs_.brake then refs_.brake:ReleaseHold() end
+    if refs_.pause then refs_.pause:SetActive(state_.paused) end
+    RefreshStatus()
+end
+
 ---@param text string
 ---@param seconds number|nil
 function Hud.Toast(text, seconds)
     Text(refs_.toastText, text or "")
     if refs_.toast then refs_.toast:Show() end
     state_.toastTime = math.max(0.1, Number(seconds, 2))
-    -- 现有 main 通过 Toast 表达暂停状态，不必修改入口 API。
-    if text == "已暂停" then
-        state_.paused = true
-        if refs_.brake then refs_.brake:ReleaseHold() end
-    elseif text == "继续行驶" then state_.paused = false end
+    -- 未迁移的旧 main 仍兼容文案协议；SetPaused 接入后只把 Toast 当提示。
+    if not explicitPause_ then
+        if text == "已暂停" then
+            state_.paused = true
+            if refs_.brake then refs_.brake:ReleaseHold() end
+        elseif text == "继续行驶" then state_.paused = false end
+    end
     if refs_.pause then refs_.pause:SetActive(state_.paused) end
     RefreshStatus()
 end
@@ -473,10 +546,54 @@ function Hud.SetMinimapVisible(visible)
     if refs_.mapKey then refs_.mapKey:SetActive(state_.mapVisible) end
 end
 
+--- 目录由 main 从 Train.GetCatalog() 注入。允许 Init 前调用，不猜测初始车型。
+---@param catalog CabTrainCatalogEntry[]?
+---@param selectedId string?
+function Hud.SetTrainCatalog(catalog, selectedId)
+    trainCatalog_ = catalog or {}
+    if refs_.trainSelector then refs_.trainSelector:SetCatalog(trainCatalog_) end
+    local id = selectedId or state_.selectedTrainId
+    for _, entry in ipairs(trainCatalog_) do
+        if entry.id == id then
+            Hud.SetSelectedTrain(id, entry.name)
+            return
+        end
+    end
+    if selectedId then Hud.SetSelectedTrain(selectedId, selectedId) end
+end
+
+--- 仅显示权威选择，不修改速度仪表或线路限速。
+---@param id string
+---@param name string
+function Hud.SetSelectedTrain(id, name)
+    state_.selectedTrainId = id or ""
+    state_.selectedTrainName = name and name ~= "" and name or "待同步车型"
+    Text(refs_.trainName, state_.selectedTrainName)
+    if refs_.trainSelector then
+        refs_.trainSelector:SetSelected(state_.selectedTrainId, state_.selectedTrainName)
+    end
+end
+
+---@return boolean
+function Hud.IsTrainSelectorOpen()
+    return refs_.trainSelector ~= nil and refs_.trainSelector:IsOpen()
+end
+
+--- 开窗只释放 UI 按住的制动，不自行改变暂停状态；关闭/重建/Shutdown 都通知 main。
+---@param open boolean
+function Hud.SetTrainSelectorOpen(open)
+    if not refs_.trainSelector then return end
+    if open then
+        if refs_.brake then refs_.brake:ReleaseHold() end
+        refs_.trainSelector:Open()
+    else refs_.trainSelector:Close() end
+end
+
 ---@class CabHudReadings
 ---@field speedKmh number
 ---@field speedLimitKmh number
 ---@field instrumentLimitKmh number 实际速度仪表使用的限速，非配置副本
+---@field instrumentMaxKmh number 实际速度仪表量程
 ---@field throttle integer
 ---@field maxThrottle integer
 ---@field brakeRatio number
@@ -486,25 +603,37 @@ end
 ---@field stationName string
 ---@field nextStation string
 ---@field mapVisible boolean
+---@field selectedTrainId string
+---@field selectedTrainName string
+---@field trainSelectorOpen boolean
 
 --- 返回显示值快照；仅供测试/验收，不允许修改 HUD 内部状态。
 ---@return CabHudReadings
 function Hud.GetReadings()
-    return {
+    local readings = {
+        selectedTrainId = state_.selectedTrainId,
+        selectedTrainName = state_.selectedTrainName,
+        trainSelectorOpen = Hud.IsTrainSelectorOpen(),
         speedKmh = state_.speed,
         speedLimitKmh = state_.limit,
         instrumentLimitKmh = refs_.meter and refs_.meter.limit_ or state_.limit,
+        instrumentMaxKmh = refs_.meter and refs_.meter.maxSpeed_ or state_.instrumentMax,
         throttle = state_.notch, maxThrottle = state_.maxNotch, brakeRatio = state_.brake,
         brakeHeld = refs_.brake ~= nil and refs_.brake.pointer_ ~= nil,
         reversing = state_.reversing, paused = state_.paused,
         stationName = state_.station, nextStation = state_.distance,
         mapVisible = state_.mapVisible,
     }
+    return readings
 end
 
 --- 验收时使用 root:FindById("speedInstrument") --[[@as CabSpeedometer?]]。
 ---@return Panel?
 function Hud.GetRoot() return refs_.root end
+
+--- 返回已挂载的选择器；验收仍应核实 GetRoot():FindById 与此引用一致。
+---@return CabTrainSelector?
+function Hud.GetTrainSelector() return refs_.trainSelector end
 
 --- 返回仪表实际布局；单位为 UI 基准像素，不乘 DPR。
 ---@return table
@@ -514,6 +643,8 @@ function Hud.GetLayout()
         controls = refs_.desk and refs_.desk:GetAbsoluteLayout() or {},
         station = refs_.info and refs_.info:GetAbsoluteLayout() or {},
         actions = refs_.actions and refs_.actions:GetAbsoluteLayout() or {},
+        trainModel = refs_.trainBar and refs_.trainBar:GetAbsoluteLayout() or {},
+        trainSelector = refs_.trainSelector and refs_.trainSelector.drawer_:GetAbsoluteLayout() or {},
         scale = UI.GetScale(),
     }
 end
@@ -525,10 +656,14 @@ function Hud.Update(dt)
     RefreshStatus()
 end
 function Hud.Shutdown()
+    if refs_.trainSelector then refs_.trainSelector:Close() end
     if refs_.brake then refs_.brake:ReleaseHold() end
     UI.Shutdown()
     refs_ = {}
     callbacks_ = {}
+    trainCatalog_ = {}
+    explicitPause_ = false
+    state_.selectedTrainId, state_.selectedTrainName = "", "待同步车型"
 end
 
 return Hud

@@ -11,20 +11,46 @@ GameConfig.Title = "火车驾驶模拟"
 -- 线路：圆角矩形环线（可无限循环驾驶）
 -- 由直线段和圆弧段拼成，最后闭合
 -- ---------------------------------------------------------------------------
+-- 大半径演示环线：12/10公里长直线，R=9000米圆弧。
+-- 用于高速驾驶模拟；未实现真实线路超高/缓和曲线认证。
 GameConfig.RouteSegments = {
-    { type = "straight", length = 900 },
-    { type = "arc", radius = 250, angle = 90, dir = 1 },
-    { type = "straight", length = 600 },
-    { type = "arc", radius = 250, angle = 90, dir = 1 },
-    { type = "straight", length = 900 },
-    { type = "arc", radius = 250, angle = 90, dir = 1 },
-    { type = "straight", length = 600 },
-    { type = "arc", radius = 250, angle = 90, dir = 1 },
+    { type = "straight", length = 12000 },
+    { type = "arc", radius = 9000, angle = 90, dir = 1 },
+    { type = "straight", length = 10000 },
+    { type = "arc", radius = 9000, angle = 90, dir = 1 },
+    { type = "straight", length = 12000 },
+    { type = "arc", radius = 9000, angle = 90, dir = 1 },
+    { type = "straight", length = 10000 },
+    { type = "arc", radius = 9000, angle = 90, dir = 1 },
 }
 
 GameConfig.RouteStart = Vector3(0, 0, 0)
 GameConfig.RouteStartYaw = 0
-GameConfig.RouteStep = 1.0        -- 采样间距（米）
+GameConfig.RouteStep = 10.0       -- 调试/包围盒点；车辆与净空使用解析线路，不插值这些点。
+
+-- 全线逻辑常驻，只有周边渲染生成。所有距离米、帧预算毫秒。
+GameConfig.WorldStream = {
+    FrameBudgetMs = 3.0,
+    MaxTaskSlices = 32,
+    RefreshInterval = 0.20,
+    TrackChunkLength = 120,
+    DetailAhead = 960,
+    DetailBehind = 600,
+    ViewAhead = 3000,
+    ViewBehind = 2800,
+    UnloadMargin = 720,
+    InitialDetailAhead = 240,
+    InitialDetailBehind = 240,
+    InitialInfrastructureRadius = 96,
+    InfrastructureChunkLength = 32,
+    InfrastructureAhead = 1500,
+    InfrastructureBehind = 1100,
+    StationRadius = 2800,
+    TerrainCellSize = 160,
+    TerrainRadius = 1120,
+    VegetationRadius = 360,
+    Seed = 20261006,
+}
 
 -- 本轮统一使用平坦线路；恢复坡度前必须同步建立对应路基与地形。
 GameConfig.HillAmplitude = 0.0
@@ -79,8 +105,10 @@ GameConfig.Train = {
 -- 玩法参数
 -- ---------------------------------------------------------------------------
 GameConfig.Gameplay = {
-    SpeedLimitKmh = 80,            -- 线路限速
-    StationBrakeDistance = 900,    -- 进入该距离内提示制动
+    SpeedLimitKmh = 350,           -- 区间上限；最终取车型、曲线、站区与进站制动的最小值
+    StationSpeedKmh = 60,          -- 站场许可速度，不是整线限速
+    BrakeReactionSeconds = 1.5,    -- 制动提示与速度包络的反应余量
+    StationBrakeDistance = 900,    -- 兼容旧接口；实际提示按 v²/(2a) 动态计算
     StopTolerance = 60,            -- 停车精度容差（米）
     DwellTime = 20,                -- 站停时间（秒）
     XpPerStation = 100,            -- 每站经验

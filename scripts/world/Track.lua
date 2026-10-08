@@ -27,8 +27,9 @@ local PROFILE = {
 }
 
 local function section(s, lateral)
-    local pos = Route.Sample(s)
-    local right = Route.RightAt(s)
+    local pos, _, yaw = Route.Sample(s)
+    local a = math.rad(yaw)
+    local right = Vector3(math.cos(a), 0, -math.sin(a))
     local out = {}
     for _, p in ipairs(PROFILE) do
         out[#out + 1] = pos + right * (lateral + p[1]) + Vector3(0, p[2], 0)
@@ -44,7 +45,8 @@ end
 ---@param startS number|nil
 ---@param endS number|nil
 ---@param heads RailwayBatch|nil
-function Track.BuildRail(body, length, lateral, startS, endS, heads)
+---@param pause fun()|nil
+function Track.BuildRail(body, length, lateral, startS, endS, heads, pause)
     local first, last = startS or 0, endS or length
     local count = math.max(1, math.ceil((last - first) / RAIL_STEP))
     local previous = section(first, lateral)
@@ -56,21 +58,25 @@ function Track.BuildRail(body, length, lateral, startS, endS, heads)
             batch:AddQuad(previous[j], previous[k], current[k], current[j])
         end
         previous = current
+        if pause and i % 4 == 0 then pause() end
     end
 end
 
 -- 连续带状斜坡碎石道床，不再用重叠平板近似。
 -- 3.2 米道床顶面高于地面，车站站台替代靠外的部分边坡。
 local function ballastSection(s)
+    local pos, _, yaw = Route.Sample(s)
+    local a = math.rad(yaw)
+    local right = Vector3(math.cos(a), 0, -math.sin(a))
     return {
-        Route.SampleOffset(s, -2.10, 0.002),
-        Route.SampleOffset(s, -1.60, 0.080),
-        Route.SampleOffset(s, 1.60, 0.080),
-        Route.SampleOffset(s, 2.10, 0.002),
+        pos - right * 2.10 + Vector3(0, 0.002, 0),
+        pos - right * 1.60 + Vector3(0, 0.080, 0),
+        pos + right * 1.60 + Vector3(0, 0.080, 0),
+        pos + right * 2.10 + Vector3(0, 0.002, 0),
     }
 end
-local function buildBallast(batch, first, last)
-    local count = math.max(1, math.ceil((last - first) / RAIL_STEP))
+local function buildBallast(batch, first, last, pause, step)
+    local count = math.max(1, math.ceil((last - first) / (step or RAIL_STEP)))
     local previous = ballastSection(first)
     for i = 1, count do
         local current = ballastSection(first + (last - first) * i / count)
@@ -78,53 +84,100 @@ local function buildBallast(batch, first, last)
             batch:AddQuad(previous[j], current[j], current[j + 1], previous[j + 1])
         end
         previous = current
+        if pause and i % 12 == 0 then pause() end
     end
 end
 
----@param scene Scene
----@return Node
-function Track.Build(scene)
-    local root = scene:CreateChild("Track")
-    local length = Route.GetLength()
-    if length <= 0 then
-        print("[Track] 错误：请先构建线路再构建轨道")
-        return root
+---@type Material[]
+local materials_ = {}
+function Track.Init()
+    if #materials_ == 0 then
+        materials_ = {World.Ballast(), World.Concrete(),
+            World.Solid(Color(0.30, 0.31, 0.32), 0.86, 0.46),
+            World.Solid(Color(0.62, 0.64, 0.66), 0.94, 0.24)}
     end
-    local t0 = os.clock()
-    local ballast = World.Ballast()
-    local concrete = World.Concrete()
-    local railBody = World.Solid(Color(0.30, 0.31, 0.32), 0.86, 0.46)
-    local railHead = World.Solid(Color(0.62, 0.64, 0.66), 0.94, 0.24)
-    local chunks = math.ceil(length / CHUNK_LENGTH)
-    local sleepers = 0
-    local vertices = 0
-    for chunk = 1, chunks do
-        local first = (chunk - 1) * CHUNK_LENGTH
-        local last = math.min(chunk * CHUNK_LENGTH, length)
-        local node = root:CreateChild("TrackChunk_" .. chunk)
-        local bb = World.NewBatch(node:CreateChild("SlopedBallast"), ballast, false, 1)
-        local sb = World.NewBatch(node:CreateChild("ConcreteSleepers"), concrete, false, 1)
-        local rb = World.NewBatch(node:CreateChild("RailISection"), railBody, false)
-        local hb = World.NewBatch(node:CreateChild("RunningHeads"), railHead, false)
-        buildBallast(bb, first, last)
-        -- 全线使用同一 0.6 米枕距网格，不在分块边界重启。
-        -- 接缝仅调整最后一根，闭合处不重复添加轨枕。
+end
+
+-- 每个范围独占根节点。调用方可传协程yield，半成品由WorldStream隐藏。
+-- 近景保留I形轨/真实枕距；远景仅简化不可辨认的轨腰，轨头高与轨距不变。
+---@param root Node
+---@param first number
+---@param last number
+---@param detailed boolean
+---@param pause fun()|nil
+---@return integer
+function Track.BuildChunk(root, first, last, detailed, pause)
+    Track.Init()
+    -- 管理块120米，但不可中断的Finish只提交至多30米网格。
+    if detailed and last-first>30.000001 then
+        local total=0
+        for at=first,last-0.000001,30 do
+            total=total+Track.BuildChunk(root:CreateChild("Detail_"..at),at,math.min(at+30,last),true,pause)
+            if pause then pause() end
+        end
+        return total
+    end
+    local bb = World.NewBatch(root:CreateChild("SlopedBallast"), materials_[1], false, 1)
+    buildBallast(bb, first, last, pause, detailed and 2 or 12)
+    local vertices = bb:Finish()
+    if pause then pause() end
+    if detailed then
+        local sb = World.NewBatch(root:CreateChild("ConcreteSleepers"), materials_[2], false, 1)
         local firstIndex = math.ceil((first - 0.000001) / SLEEPER_STEP)
         local lastIndex = math.ceil((last - 0.000001) / SLEEPER_STEP) - 1
         for index = firstIndex, lastIndex do
             local s = index * SLEEPER_STEP
-            if s < length - 0.30 then
+            if s < Route.GetLength() - 0.30 then
                 local pos, _, yaw = Route.Sample(s)
                 sb:AddBox(pos + Vector3(0, 0.110, 0), Vector3(2.60, 0.10, 0.24), math.rad(yaw))
-                sleepers = sleepers + 1
+            end
+            if pause and index % 12 == 0 then pause() end
+        end
+        vertices = vertices + sb:Finish()
+        if pause then pause() end
+        local rb = World.NewBatch(root:CreateChild("RailISection"), materials_[3], false)
+        local hb = World.NewBatch(root:CreateChild("RunningHeads"), materials_[4], false)
+        Track.BuildRail(rb, Route.GetLength(), -RAIL_CENTRE, first, last, hb, pause)
+        Track.BuildRail(rb, Route.GetLength(), RAIL_CENTRE, first, last, hb, pause)
+        vertices = vertices + rb:Finish()
+        if pause then pause() end
+        vertices = vertices + hb:Finish()
+    else
+        local heads = World.NewBatch(root:CreateChild("DistantRunningHeads"), materials_[4], false)
+        local count = math.max(1, math.ceil((last - first) / 12))
+        for i = 1, count do
+            local s0, s1 = first + (last - first) * (i - 1) / count, first + (last - first) * i / count
+            for side = -1, 1, 2 do
+                local lateral = side * RAIL_CENTRE
+                heads:AddQuad(Route.SampleOffset(s0, lateral - HEAD_WIDTH / 2, 0.34),
+                    Route.SampleOffset(s1, lateral - HEAD_WIDTH / 2, 0.34),
+                    Route.SampleOffset(s1, lateral + HEAD_WIDTH / 2, 0.34),
+                    Route.SampleOffset(s0, lateral + HEAD_WIDTH / 2, 0.34))
             end
         end
-        Track.BuildRail(rb, length, -RAIL_CENTRE, first, last, hb)
-        Track.BuildRail(rb, length, RAIL_CENTRE, first, last, hb)
-        vertices = vertices + bb:Finish() + sb:Finish() + rb:Finish() + hb:Finish()
+        vertices = vertices + heads:Finish()
     end
-    print(string.format("[Track] 轨距 %.3f 米，轨面 0.340 米；轨枕 %d 根/枕距 0.6 米；%d 块/%d 网格，%d 顶点，耗时 %.2f 秒",
-        GAUGE, sleepers, chunks, chunks * 4, vertices, os.clock() - t0))
+    return vertices
+end
+
+-- 保留测试入口但默认只建首站附近，不意外同步构建100公里。
+---@param scene Scene
+---@param initialS number|nil
+---@return Node
+function Track.Build(scene, initialS)
+    local root = scene:CreateChild("TrackPreview")
+    local s = initialS or 0
+    local count = math.ceil(Route.GetLength() / CHUNK_LENGTH)
+    local seen = {}
+    for at = s - 240, s + 360, CHUNK_LENGTH do
+        local index = math.min(count - 1, math.floor(Route.Wrap(at) / CHUNK_LENGTH))
+        if not seen[index] then
+            seen[index] = true
+            local first = index * CHUNK_LENGTH
+            Track.BuildChunk(root:CreateChild("TrackChunk_" .. index), first,
+                math.min(first + CHUNK_LENGTH, Route.GetLength()), true)
+        end
+    end
     return root
 end
 

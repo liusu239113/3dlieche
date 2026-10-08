@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<material>
+	<technique name="Techniques/PBR/PBRMetallicRoughDiffNormalSpecMask.xml" quality="0" loddistance="0" />
+	<texture unit="diffuse" name="RailwayVegetation/Environment/Vegetation/Bushes/Shared/Textures/Bush03_BaseColor.tga" />
+	<texture unit="normal" name="RailwayVegetation/Environment/Vegetation/Bushes/Shared/Textures/Bush03_Normal.tga" />
+	<texture unit="specular" name="RailwayVegetation/Environment/Vegetation/Bushes/Shared/Textures/Bush03_Mix.tga" />
+	<parameter name="UOffset" value="1 0 0 0" />
+	<parameter name="VOffset" value="0 1 0 0" />
+	<cull value="none" />
+	<backsideLighting enable="true" />
+	<shadowcull value="ccw" />
+	<fill value="solid" />
+	<depthbias constant="0" slopescaled="0" />
+	<alphatocoverage enable="false" />
+	<lineantialias enable="false" />
+	<renderorder value="128" />
+	<occlusion enable="true" />
+	<uvTiling value="1 1" />
+	<uvOffset value="0 0" />
+	<uvSpeed value="0 0" />
+	<texRotation value="0" />
+</material>

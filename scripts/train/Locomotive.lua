@@ -3,6 +3,8 @@
 -- ============================================================================
 
 local GameConfig = require "config.GameConfig"
+local RollingStock = require "train.RollingStock"
+local Catalog = require "config.TrainCatalog"
 
 local Locomotive = {}
 
@@ -222,30 +224,82 @@ local function calibrateModel(source)
     return model
 end
 
----@param parent Node
----@return Node
-function Locomotive.Build(parent)
-    if not calibratedModel_ then
-        local source = assert(cache:GetResource("Model", MODEL_PATH), "已验收机车 MDL 加载失败")
-        assert(source.numGeometries == 1, "机车网格结构与验收资产不一致")
-        calibratedModel_ = calibrateModel(source)
-        material_ = Material:new()
-        material_:SetTechnique(0, assert(cache:GetResource("Technique", "Techniques/PBR/PBRDiffNormal.xml")))
-        -- 显式引用本地贴图，保留生成资产的 UV/法线，不用纯色材质覆盖涂装。
-        material_:SetTexture(TU_DIFFUSE, assert(cache:GetResource("Texture2D", DIFFUSE_PATH)))
-        material_:SetTexture(TU_NORMAL, assert(cache:GetResource("Texture2D", NORMAL_PATH)))
-        material_:SetShaderParameter("Metallic", Variant(0.12))
-        material_:SetShaderParameter("Roughness", Variant(0.62))
-    end
+--- 仅显式离线烘焙调用；正常Prepare不应调用此全网格算法。
+---@return Model
+function Locomotive.CalibrateOffline()
+    local source = assert(cache:GetResource("Model", MODEL_PATH), "离线蓝白源模型缺失")
+    assert(source.numGeometries == 1, "蓝白源结构改变")
+    return calibrateModel(source)
+end
 
+---@param id? string
+---@return boolean, string
+function Locomotive.Prepare(id)
+    if id and id ~= "blue_white" then return RollingStock.Prepare(id) end
+    if calibratedModel_ then return true, "原蓝白资产已校准" end
+    local ok, message = pcall(function()
+        local model = RollingStock.LoadBakedModel("blue_white")
+        assert(model.numGeometries == 1, "原蓝白烘焙网格结构不一致")
+        local material = Material:new()
+        material:SetTechnique(0, assert(cache:GetResource("Technique", "Techniques/PBR/PBRDiffNormal.xml")))
+        material:SetTexture(TU_DIFFUSE, assert(cache:GetResource("Texture2D", DIFFUSE_PATH)))
+        material:SetTexture(TU_NORMAL, assert(cache:GetResource("Texture2D", NORMAL_PATH)))
+        material:SetShaderParameter("Metallic", Variant(0.12))
+        material:SetShaderParameter("Roughness", Variant(0.62))
+        calibratedModel_, material_ = model, material
+    end)
+    if not ok then return false, tostring(message) end
+    return true, "原蓝白资产已校准"
+end
+
+---@param parent Node
+---@param id? string
+---@return Node
+function Locomotive.Build(parent, id)
+    local ok, message = Locomotive.Prepare(id)
+    assert(ok, message)
+    if id and id ~= "blue_white" then
+        local node, drawable = RollingStock.Build(parent, id)
+        drawable_ = drawable
+        drawable_.enabled = not cabView_
+        return node
+    end
     local node = parent:CreateChild("LocomotiveModel")
     drawable_ = node:CreateComponent("StaticModel")
-    drawable_.model = calibratedModel_
-    drawable_:SetMaterial(material_)
+    drawable_.model = assert(calibratedModel_)
+    drawable_:SetMaterial(assert(material_))
     drawable_.castShadows = true
     drawable_.enabled = not cabView_
-    print("[Locomotive] 已验收蓝白机车已接入，完整车体替换旧积木造型")
+    print("[Locomotive] 原蓝白机车使用原专用校准，未套中国车型profile")
     return node
+end
+
+---@param head string
+---@param middle? string
+function Locomotive.ReleaseExcept(head, middle)
+    RollingStock.ReleaseExcept(head, middle)
+    if head ~= "blue_white" and calibratedModel_ then
+        -- 旧drawable已移除并重新登记，释放模块强引用后让cache回收无用户资源。
+        calibratedModel_, material_ = nil, nil
+        local asset = assert(Catalog.Assets.blue_white)
+        cache:ReleaseResource("Model", asset.modelPath)
+        cache:ReleaseResource("Texture2D", DIFFUSE_PATH)
+        cache:ReleaseResource("Texture2D", NORMAL_PATH)
+    end
+end
+
+--- 为动车头车登记驾驶视角外壳，不触碰中间车和反向尾车。
+---@param drawable StaticModel
+function Locomotive.RegisterLead(drawable)
+    drawable_ = drawable
+    drawable.enabled = not cabView_
+end
+
+---@param id? string
+---@return number
+function Locomotive.GetLength(id)
+    local profile = id and Catalog.Profiles[id]
+    return profile and profile.length or Locomotive.Length
 end
 
 --- 司机视角不渲染自己的外壳，避免生成资产的不透明玻璃遮住前方线路。

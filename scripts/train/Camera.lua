@@ -5,6 +5,7 @@
 local GameConfig = require "config.GameConfig"
 local Route = require "world.Route"
 local Locomotive = require "train.Locomotive"
+local Train = require "train.Train"
 local ThirdPersonCamera = require "urhox-libs.Camera.ThirdPersonCamera"
 
 local Camera = {}
@@ -139,10 +140,17 @@ end
 function Camera.Update(dt, trainS)
     if not follow_ or not target_ or not node_ or not camera_ then return end
     local position, _, yaw = Route.Sample(Route.Wrap(trainS))
-    target_.position = position
     local rotation = Quaternion(yaw, Vector3.UP)
+    local lead = Train.GetLeadNode()
+    if lead then
+        -- Train两支点弦姿态是唯一来源，不能司机相机另采弧线而相对车头摆动。
+        position = lead.worldPosition
+        rotation = lead.worldRotation
+        yaw = rotation:YawAngle()
+    end
+    target_.position = position
     if mode_ == "cab" then
-        node_.position = position + rotation * Vector3(0, 3.35, Locomotive.Length * 0.5 - 2.2)
+        node_.position = position + rotation * Train.GetCabOffset()
         node_.rotation = Quaternion(yaw + yawOffset_, Vector3.UP) * Quaternion(pitch_, Vector3.RIGHT)
         camera_.fov = MODES.cab.fov
         return

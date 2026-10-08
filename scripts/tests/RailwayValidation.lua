@@ -260,6 +260,7 @@ end
 
 function Start()
     startGame()
+    assert(SelectTrain("blue_white"), "原蓝白机车回归车型无法加载")
     TogglePause()
     scene_ = renderer:GetViewport(0).scene
     checkRoute()

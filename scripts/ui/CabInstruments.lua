@@ -40,6 +40,11 @@ function Speedometer:Init(props)
     self.maxSpeed_ = math.max(40, props.maxSpeed or 120)
 end
 
+---@param maximum number
+function Speedometer:SetRange(maximum)
+    self.maxSpeed_ = math.max(40, math.ceil(maximum / 20) * 20)
+end
+
 ---@param speed number
 ---@param limit number|nil
 function Speedometer:SetReading(speed, limit)
@@ -79,15 +84,17 @@ function Speedometer:Render(vg)
     nvgStrokeWidth(vg, 0.8)
     nvgStroke(vg)
 
-    -- 固定 km/h 标尺符合机车构造速度，橙色游标标识当前限速。
+    -- 量程随车型切换；高速表减少密集数字，橙色游标单独显示当前线路限制。
     nvgBeginPath(vg)
     nvgArc(vg, cx, cy, r * 0.90, start, start + sweep, NVG_CW)
     nvgStrokeColor(vg, Skin.Color({ 141, 165, 169, 70 }))
     nvgStrokeWidth(vg, 1)
     nvgStroke(vg)
-    for value = 0, math.floor(self.maxSpeed_), 5 do
+    local majorStep = self.maxSpeed_ > 200 and 50 or 20
+    local minorStep = self.maxSpeed_ > 200 and 10 or 5
+    for value = 0, math.floor(self.maxSpeed_), minorStep do
         local a = start + sweep * value / self.maxSpeed_
-        local major = value % 20 == 0
+        local major = value % majorStep == 0
         local outer = r * 0.86
         local inner = r * (major and 0.73 or 0.80)
         local cosA, sinA = math.cos(a), math.sin(a)

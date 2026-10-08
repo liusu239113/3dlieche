@@ -64,6 +64,8 @@ local function construct(definitions)
     local yaw = (GameConfig.RouteStartYaw or 0) * 1.0
     for _, def in ipairs(definitions) do
         local radius = def.radius or 0
+        if def.type ~= "straight" and def.type ~= "arc" then return false end
+        if def.type == "arc" and ((def.angle or 0) <= 0 or (def.angle or 0) > 360) then return false end
         local segLength = def.type == "arc" and radius * math.rad(def.angle or 0) or (def.length or 0)
         if segLength <= 0 or (def.type == "arc" and radius <= 0) then
             return false
@@ -88,16 +90,11 @@ end
 function Route.Build()
     baseY_ = 0.0
     if not construct(GameConfig.RouteSegments or {}) then
-        print("[Route] 错误：配置线路未闭合，改用安全圆角矩形")
-        construct({
-            { type = "straight", length = 900 }, { type = "arc", radius = 250, angle = 90, dir = 1 },
-            { type = "straight", length = 600 }, { type = "arc", radius = 250, angle = 90, dir = 1 },
-            { type = "straight", length = 900 }, { type = "arc", radius = 250, angle = 90, dir = 1 },
-            { type = "straight", length = 600 }, { type = "arc", radius = 250, angle = 90, dir = 1 },
-        })
+        Route.Clear()
+        error("[Route] 线路段无效或位置/切线未闭合；拒绝静默回退到小半径线路")
     end
     points_ = {}
-    local step = math.max(0.5, math.min(2.5, GameConfig.RouteStep or 1.0))
+    local step = math.max(0.5, math.min(50, GameConfig.RouteStep or 10.0))
     for _, seg in ipairs(segments_) do
         local count = math.max(1, math.ceil(seg.length / step))
         for i = 1, count do
@@ -193,31 +190,37 @@ function Route.TangentAt(s)
     return tangent
 end
 
--- 净空设计（XZ 平面）：检测整条线路每段，包括 L -> 0 接缝。
---                      建筑完整外包圆半径 r
---       铁路  --------------------  ( O )
---                    圆心到线路距离 - r >= 25.01 米
--- 外包圆包括墙角、屋顶、入口挑檐；对弯道、环线另一侧及接缝均保守安全。
--- 采样弦误差在当前半径和步长下小于 0.004 米，再预留 0.01 米。
+-- 解析整条线路的最近点：直线投影、有限圆弧径向投影及端点。
+-- 与可见分块完全无关，闭合另一侧/接缝也参与净空；不再扫十万米采样弦。
 ---@param worldPos Vector3
 ---@return number distance, number s
 function Route.DistanceTo(worldPos)
     local bestD2, bestS = math.huge, 0.0
-    for i, a in ipairs(points_) do
-        local b = points_[i + 1] or points_[1]
-        if not b then break end
-        local dx, dz = b.pos.x - a.pos.x, b.pos.z - a.pos.z
-        local span2 = dx * dx + dz * dz
-        if span2 > 0.0000001 then
-            local t = math.max(0, math.min(1,
-                ((worldPos.x - a.pos.x) * dx + (worldPos.z - a.pos.z) * dz) / span2))
-            local ex = worldPos.x - (a.pos.x + dx * t)
-            local ez = worldPos.z - (a.pos.z + dz * t)
-            local d2 = ex * ex + ez * ez
-            if d2 < bestD2 then
-                bestD2 = d2
-                local endS = i == #points_ and length_ or b.s
-                bestS = Route.Wrap(a.s + (endS - a.s) * t)
+    local function consider(seg, ds)
+        local position = sampleSegment(seg, ds)
+        local dx, dz = worldPos.x - position.x, worldPos.z - position.z
+        local d2 = dx * dx + dz * dz
+        if d2 < bestD2 then
+            bestD2, bestS = d2, Route.Wrap(seg.s + ds)
+        end
+    end
+    for _, seg in ipairs(segments_) do
+        if seg.type == "straight" then
+            local a = math.rad(seg.yaw)
+            local ds = (worldPos.x - seg.pos.x) * math.sin(a) + (worldPos.z - seg.pos.z) * math.cos(a)
+            consider(seg, math.max(0, math.min(seg.length, ds)))
+        else
+            consider(seg, 0)
+            consider(seg, seg.length)
+            local dx, dz = worldPos.x - seg.center.x, worldPos.z - seg.center.z
+            if dx * dx + dz * dz > 0.000000001 then
+                -- 径向向量 = -dir*right(yaw)，atan(y,x)支持完整象限。
+                local yaw = math.atan(seg.dir * dz, -seg.dir * dx)
+                local turn = (seg.dir * (yaw - math.rad(seg.yaw))) % (2 * math.pi)
+                local sweep = seg.length / seg.radius
+                if turn <= sweep + 0.000000001 then
+                    consider(seg, math.min(seg.length, turn * seg.radius))
+                end
             end
         end
     end
@@ -236,21 +239,39 @@ end
 function Route.AssignStations()
     local out = {}
     for i, st in ipairs(GameConfig.Stations) do
+        assert(type(st.at) == "number" and st.at >= 0 and st.at < 1,
+            "[Route] 站点比例必须位于[0,1)：" .. tostring(st.name))
         local target = Route.Wrap(st.at * length_)
         local bestS, bestDelta = target, math.huge
-        -- 只移动弧长位置，站名、索引及顺序不变；结果在构建时缓存。
-        -- 完整站台必须位于直线内，两端与圆弧各保留至少 10 米。
+        -- 保留名称/index/顺序；完整站台必须落在同一直线，两端留10米。
+        -- target±L保证跨闭合接缝仍找真正最近的合法停靠点。
         for _, seg in ipairs(segments_) do
             if seg.type == "straight" and seg.length >= Route.PlatformEnd - Route.PlatformStart + 20 then
                 local first = seg.s - Route.PlatformStart + 10
                 local last = seg.s + seg.length - Route.PlatformEnd - 10
-                local candidate = math.max(first, math.min(last, target))
-                local delta = math.abs(candidate - target)
-                delta = math.min(delta, length_ - delta)
-                if delta < bestDelta then bestS, bestDelta = candidate, delta end
+                for wrap = -1, 1 do
+                    local unwrapped = target + wrap * length_
+                    local candidate = math.max(first, math.min(last, unwrapped))
+                    local delta = math.abs(candidate - unwrapped)
+                    if delta < bestDelta then bestS, bestDelta = candidate, delta end
+                end
             end
         end
-        out[#out + 1] = { name = st.name, s = bestS, index = i }
+        assert(bestDelta < math.huge, "[Route] 找不到完整直线站台：" .. tostring(st.name))
+        out[#out + 1] = { name = st.name, s = Route.Wrap(bestS), index = i }
+    end
+    -- 按配置顺序仅允许一圈递增；重叠/倒序不能只打印后继续运行。
+    local travel = 0.0
+    if #out > 1 then
+        for i, st in ipairs(out) do
+            local following = out[i % #out + 1]
+            if following then
+                local distance = Route.ForwardDistance(st.s, following.s)
+                assert(distance >= 350, "[Route] 站点重叠或间距不足350米：" .. st.name)
+                travel = travel + distance
+            end
+        end
+        assert(math.abs(travel - length_) < 0.01, "[Route] 分配后的站点顺序不是单圈递增")
     end
     return out
 end

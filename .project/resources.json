@@ -2,12 +2,27 @@
   "$schema": "../schemas/resources.schema.json",
 
   "preload_groups": [
-
+    "rolling_stock_start",
+    "environment_start"
   ],
 
   "groups": {
     "default": [
       "**"
+    ],
+    "rolling_stock_start": [
+      "RollingStockBaked/CR400AF_head.mdl",
+      "RollingStockBaked/CR400AF_middle.mdl",
+      "RollingStockBaked/CR400AF_head.json",
+      "RollingStockBaked/CR400AF_middle.json",
+      "RollingStockBaked/CR400AF_head_D.jpg",
+      "RollingStockBaked/CR400AF_head_N.png",
+      "RollingStockBaked/CR400AF_middle_D.jpg",
+      "RollingStockBaked/CR400AF_middle_N.png"
+    ],
+    "environment_start": [
+      "Textures/Skybox.xml",
+      "Textures/Skybox.ktx"
     ]
   }
 }

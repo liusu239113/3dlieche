@@ -1,14 +1,12 @@
 -- ============================================================================
 -- 火车驾驶模拟 - 主入口
--- 中式客运线路：5 座车站、蓝白长机罩内燃机车 + 客车编组、驾驶仪表
+-- 中式客运线路：5 座车站、多种中国机车与8节动车组、驾驶仪表
 -- ============================================================================
 
 local GameConfig = require "config.GameConfig"
-local Materials = require "config.Materials"
 local Route = require "world.Route"
-local Track = require "world.Track"
-local Station = require "world.Station"
-local Terrain = require "world.Terrain"
+local WorldStream = require "world.WorldStream"
+local SkyUtils = require "urhox-libs.Rendering.SkyUtils"
 local Train = require "train.Train"
 local Camera = require "train.Camera"
 local Hud = require "ui.Hud"
@@ -20,6 +18,35 @@ local scene_ = nil
 local paused_ = false
 local brakeHeld_ = false
 local touchBrakeHeld_ = false
+local selectorOpen_ = false
+
+-- 菜单暂停和用户暂停独立；关菜单不能把原本已暂停的游戏自动恢复。
+local function IsPaused() return paused_ or selectorOpen_ end
+
+local function SyncPause()
+    local paused = IsPaused()
+    Hud.SetPaused(paused)
+    AudioManager.SetSuspended(paused)
+    if paused then brakeHeld_, touchBrakeHeld_ = false, false end
+end
+
+---@param id string
+---@return boolean, string
+function SelectTrain(id)
+    if math.abs(Train.GetSpeedKmh()) > 0.1 then
+        return false, "请先停稳后再换车"
+    end
+    local ok, message = Train.Select(id)
+    if not ok then return false, message end
+    brakeHeld_, touchBrakeHeld_ = false, false
+    Hud.SetSelectedTrain(Train.GetSelectedId(), Train.GetSelectedName())
+    AudioManager.SetPowerType(Train.GetPowerType())
+    local lead = Train.GetLeadNode()
+    if lead then AudioManager.SetTrainPose(lead.worldPosition, lead.worldRotation) end
+    Game.UpdateHud(0)
+    print("[Main] 换车完成，保留站序/经验/线路位置: " .. Train.GetSelectedName())
+    return true, message
+end
 
 -- ============================================================================
 -- 生命周期
@@ -31,42 +58,57 @@ function Start()
     print("========================================")
 
     local t0 = os.clock()
+    paused_, selectorOpen_ = false, false
+    brakeHeld_, touchBrakeHeld_ = false, false
 
     scene_ = Scene()
     scene_:CreateComponent("Octree")
     scene_:CreateComponent("DebugRenderer")
 
-    CreateLighting()
     Route.Build()
-    Track.Build(scene_)
-    Station.Build(scene_)
-    Terrain.Build(scene_)
-    Train.Build(scene_)
-    -- 首次展示在北京站入口的直线段，避免旧起点被外围建筑遮挡。
+    CreateLighting()
+    -- 从首站驶出后的直线区间开始，可直接体验牵引而不是先在55米内停车。
     local firstStation = Route.GetStations()[1]
-    if firstStation then Train.Reset(firstStation.s - 55.0) end
+    local initialS = firstStation and firstStation.s + 600 or 600
+    WorldStream.Build(scene_, initialS)
+    Train.Build(scene_)
+    Train.Reset(initialS)
     Camera.Build(scene_)
+    local cameraNode = assert(Camera.GetNode())
+    local listener = cameraNode:CreateComponent("SoundListener")
+    audio:SetListener(listener)
 
-    AudioManager.Init(scene_, scene_:GetChild("Train"))
+    AudioManager.Init(scene_, scene_:GetChild("Train"), Train.GetPowerType())
     Hud.Init({
-        onThrottleUp = function() Game.ThrottleUp() end,
-        onThrottleDown = function() Game.ThrottleDown() end,
-        onBrake = function() Game.Brake(0.25) end,
-        onBrakeHold = function(held) touchBrakeHeld_ = held end,
+        onThrottleUp = function() if not selectorOpen_ then Game.ThrottleUp() end end,
+        onThrottleDown = function() if not selectorOpen_ then Game.ThrottleDown() end end,
+        onBrake = function() if not selectorOpen_ then Game.Brake(0.25) end end,
+        onBrakeHold = function(held) touchBrakeHeld_ = held and not selectorOpen_ end,
         onBrakeRelease = function() touchBrakeHeld_ = false end,
         onReleaseBrake = function()
-            if not Game.IsDwelling() then Train.SetBrake(0) end
+            if not selectorOpen_ and not Game.IsDwelling() then Train.SetBrake(0) end
         end,
         onReverse = function()
+            if selectorOpen_ then return end
             local reversing = Train.ToggleReversing()
             Hud.SetReversing(reversing)
             Hud.Toast(reversing and "换向：后退" or "换向：前进", 1.5)
         end,
-        onSwitch = function(dir) Game.SetSwitch(dir) end,
-        onHorn = function() Game.Horn() end,
-        onCamera = function() Camera.CycleMode() end,
+        onSwitch = function(dir) if not selectorOpen_ then Game.SetSwitch(dir) end end,
+        onHorn = function() if not selectorOpen_ then Game.Horn() end end,
+        onCamera = function() if not selectorOpen_ then Camera.CycleMode() end end,
         onPause = function() TogglePause() end,
+        onSelectTrain = SelectTrain,
+        onOpenTrainSelector = function(open)
+            selectorOpen_ = open
+            SyncPause()
+            print("[Main] 车型选择器 " .. (open and "打开" or "关闭"))
+        end,
     })
+    local catalog = Train.GetCatalog() --[[@as CabTrainCatalogEntry[] ]]
+    Hud.SetTrainCatalog(catalog, Train.GetSelectedId())
+    Hud.SetSelectedTrain(Train.GetSelectedId(), Train.GetSelectedName())
+    SyncPause()
 
     Game.Init()
     Game.UpdateHud(0)
@@ -78,6 +120,7 @@ function Start()
 end
 
 function Stop()
+    WorldStream.Shutdown()
     AudioManager.Shutdown()
     Hud.Shutdown()
 end
@@ -86,31 +129,45 @@ end
 -- 光照
 -- ============================================================================
 
--- 自建平色环境光与雾色背景，不依赖远端环境全景资源。
--- 如后续启用预设IBL，应直接替换本组Zone/太阳，避免叠加两个Zone。
+-- 显式创建日间光照，不依赖包含编辑器专用资源的预设。
 function CreateLighting()
-    local zoneNode = scene_:CreateChild("Zone")
-    local zone = zoneNode:CreateComponent("Zone")
-    zone.boundingBox = BoundingBox(Vector3(-3000, -3000, -3000), Vector3(3000, 3000, 3000))
+    if not scene_ then return end
+    local group = scene_:CreateChild("DayLighting")
+    local zone = group:CreateComponent("Zone")
     zone.ambientSource = AMBIENT_COLOR
-    zone.ambientColor = Color(0.32, 0.35, 0.39)
-    -- 背景 = 雾色，形成天空
-    zone.fogColor = Color(0.58, 0.72, 0.88)
-    zone.fogStart = 300.0
-    zone.fogEnd = 1600.0
-
-    -- 太阳（方向光）
-    local sunNode = scene_:CreateChild("Sun")
+    zone.ambientColor = Color(0.16, 0.18, 0.21)
+    -- 覆盖新大半径线路，不能沿用旧环线±5000米的Zone。
+    zone.boundingBox = BoundingBox(Vector3(-60000, -1000, -60000), Vector3(60000, 2000, 60000))
+    zone.fogColor = Color(0.59, 0.66, 0.71)
+    zone.fogStart = 450.0
+    zone.fogEnd = 1450.0
+    -- 显式使用解析 ACES，避免离屏 GLES 环境的 3D LUT Shader 编译失败。
+    zone.tonemapMode = TONEMAP_MODE_ACES
+    zone.vignetteEnabled = false
+    -- 亚像素接触线和薄雨棚边缘使用FXAA，避免移动端近景锯齿。
+    zone.fxaaEnabled = true
+    -- 固定日间曝光，避免移动端多一组全屏亮度直方图。
+    zone.autoExposureEnabled = false
+    local sunNode = group:CreateChild("Sun")
     sunNode.direction = Vector3(0.45, -1.0, 0.55)
     local sun = sunNode:CreateComponent("Light")
     sun.lightType = LIGHT_DIRECTIONAL
-    sun.color = Color(1.0, 0.97, 0.90)
-    sun.brightness = 2.0
-    sun.castShadows = true
-    sun.shadowBias = BiasParameters(0.00025, 0.5)
-    sun.shadowCascade = CascadeParameters(20.0, 80.0, 320.0, 0.0, 0.85)
-
-    print("[Main] 光照与雾色天空就绪")
+    if sun then
+        sun.color = Color(1.0, 0.96, 0.88)
+        sun.brightness = 1.15
+        sun.castShadows = true
+        sun.shadowBias = BiasParameters(0.00025, 0.5)
+        sun.shadowCascade = CascadeParameters(20.0, 80.0, 320.0, 0.0, 0.85)
+    end
+    -- 程序化渐变仍由库创建；官方默认天空依赖已补齐真实XML与六面KTX资源。
+    SkyUtils.CreateGradientSky(scene_, {
+        zenith = Color(0.16, 0.32, 0.54),
+        horizon = zone.fogColor,
+        ground = Color(0.32, 0.37, 0.29),
+        skyExp = 0.65,
+        hdrBoost = 1.45,
+    })
+    print("[Main] 日间太阳光、渐变天空、低饱和远景雾与ACES已加载")
 end
 
 -- ============================================================================
@@ -118,7 +175,9 @@ end
 -- ============================================================================
 
 function TogglePause()
+    if selectorOpen_ then return end
     paused_ = not paused_
+    SyncPause()
     Hud.Toast(paused_ and "已暂停" or "继续行驶", 1.5)
 end
 
@@ -134,7 +193,7 @@ function HandleUpdate(eventType, eventData)
 
     HandleKeyboard(dt)
 
-    if not paused_ then
+    if not IsPaused() then
         -- 刹车按钮按住时持续制动
         if brakeHeld_ or touchBrakeHeld_ then
             Train.AddBrake(1.6 * dt)
@@ -154,8 +213,12 @@ function HandlePostUpdate(eventType, eventData)
     local dt = eventData:GetFloat("TimeStep")
     if dt > 0.1 then dt = 0.1 end
 
-    Train.UpdateVisuals(paused_ and 0 or dt)
+    Train.UpdateVisuals(IsPaused() and 0 or dt)
+    local lead = Train.GetLeadNode()
+    if lead then AudioManager.SetTrainPose(lead.worldPosition, lead.worldRotation) end
     Camera.Update(dt, Train.GetS())
+    -- 选择器/用户暂停期间也补齐当前画面，但不会推进车辆和玩法。
+    WorldStream.Update(Train.GetS(), dt)
 end
 
 -- ============================================================================
@@ -164,6 +227,10 @@ end
 
 ---@param dt number
 function HandleKeyboard(dt)
+    if selectorOpen_ then
+        brakeHeld_, touchBrakeHeld_ = false, false
+        return
+    end
     -- 油门
     if input:GetKeyPress(KEY_W) then Game.ThrottleUp() end
     if input:GetKeyPress(KEY_S) then Game.ThrottleDown() end

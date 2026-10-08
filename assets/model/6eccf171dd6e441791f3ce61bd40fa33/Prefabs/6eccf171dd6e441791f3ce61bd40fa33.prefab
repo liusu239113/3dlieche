@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<node>
+	<attribute name="Is Enabled" value="true" />
+	<attribute name="Name" value="6eccf171dd6e441791f3ce61bd40fa33" />
+	<attribute name="Tags" value="" />
+	<attribute name="Position" value="0 0 0" />
+	<attribute name="Rotation" value="1 0 0 0" />
+	<attribute name="Scale" value="1 1 1" />
+	<attribute name="Variables" value="" />
+	<component type="StaticModel">
+		<attribute name="Model" value="Model;uuid://Dr9uKTzacWUvWHKhiidB-MSI" />
+		<attribute name="Material" value="Material;uuid://ADP8AUKmKgzV5AX9Ar-C3-kZ" />
+		<attribute name="Cast Shadows" value="true" />
+	</component>
+</node>
