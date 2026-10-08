@@ -1,6 +1,7 @@
 -- ============================================================================
 -- AudioManager - 音效与车站广播
--- 引擎声 / 汽笛 / 制动 / 轮轨声 / 站台环境音 / 到发车广播
+-- 汽笛 / 制动 / 站台环境音 / 到发车广播
+-- 不播放持续行驶音：循环牵引/轮轨声体验差且各车型无法区分，已移除。
 -- 资源缺失时静默降级，不影响游戏运行
 -- ============================================================================
 
@@ -18,10 +19,6 @@ local _missing = {}
 local _audioNode = nil
 
 -- 声源
----@type SoundSource3D|nil
-local engineSource_ = nil
----@type SoundSource3D|nil
-local clackSource_ = nil
 ---@type SoundSource|nil
 local hornSource_ = nil
 ---@type SoundSource|nil
@@ -31,12 +28,6 @@ local ambienceSource_ = nil
 ---@type SoundSource|nil
 local announcerSource_ = nil
 
----@type Sound|nil
-local tractionSound_ = nil
----@type Node|nil
-local engineNode_ = nil
----@type Node|nil
-local clackNode_ = nil
 local powerType_ = "diesel"
 local suspended_ = false
 local ambienceOn_ = false
@@ -73,34 +64,13 @@ function AudioManager.Init(scene, trainRoot, powerType)
     _audioNode = Node()
     local node = _audioNode
 
-    -- 列车根节点保持不动；每帧将两个声源更新到真实头车姿态。
-    if trainRoot then
-        engineNode_ = trainRoot:CreateChild("EngineAudio")
-        engineSource_ = engineNode_:CreateComponent("SoundSource3D")
-        engineSource_.nearDistance = 5.0
-        engineSource_.farDistance = 260.0
-        engineSource_.rolloffFactor = 1.4
-
-        clackNode_ = trainRoot:CreateChild("ClackAudio")
-        clackSource_ = clackNode_:CreateComponent("SoundSource3D")
-        clackSource_.nearDistance = 4.0
-        clackSource_.farDistance = 120.0
-        clackSource_.rolloffFactor = 1.8
-    end
+    -- 不创建牵引/轮轨 3D 循环声源；行驶中只有玩家主动触发的汽笛与制动。
+    powerType_ = powerType == "diesel" and "diesel" or "electric"
 
     hornSource_ = node:CreateChild("Horn"):CreateComponent("SoundSource")
     brakeSource_ = node:CreateChild("Brake"):CreateComponent("SoundSource")
     ambienceSource_ = node:CreateChild("Ambience"):CreateComponent("SoundSource")
     announcerSource_ = node:CreateChild("Announcer"):CreateComponent("SoundSource")
-
-    AudioManager.SetPowerType(powerType or "diesel")
-
-    -- 轮轨声循环（音量随速度调制）
-    local clack = load(SFX .. "rail_clack.mp3")
-    if clack and clackSource_ then
-        clack:SetLooped(true)
-        clackSource_:Play(clack, clack:GetFrequency(), 0.0)
-    end
 
     -- 站台环境音（靠近车站时淡入）
     local amb = load(SFX .. "station_ambience.mp3")
@@ -110,47 +80,28 @@ function AudioManager.Init(scene, trainRoot, powerType)
         ambienceOn_ = true
     end
 
-    print("[Audio] 音频系统就绪")
+    print("[Audio] 音频系统就绪（无持续行驶音）")
 end
 
 ---@param powerType string
 function AudioManager.SetPowerType(powerType)
+    -- 保留动力类型供汽笛等音效区分；不再切换持续牵引循环声。
     powerType_ = powerType == "diesel" and "diesel" or "electric"
-    if engineSource_ then engineSource_:StopImmediate() end
-    local path = powerType_ == "diesel" and SFX .. "engine_idle_loop.mp3"
-        or SFX .. "electric_traction_loop.mp3"
-    tractionSound_ = load(path)
-    if tractionSound_ and engineSource_ then
-        tractionSound_:SetLooped(true)
-        engineSource_:Play(tractionSound_, tractionSound_:GetFrequency(), 0.0)
-    end
-    print("[Audio] 牵引动力声切换: " .. powerType_)
 end
 
 ---@param position Vector3
 ---@param rotation Quaternion
 function AudioManager.SetTrainPose(position, rotation)
-    if engineNode_ then
-        engineNode_.worldPosition = position + rotation * Vector3(0, 1.4, -2.5)
-        engineNode_.worldRotation = rotation
-    end
-    if clackNode_ then
-        clackNode_.worldPosition = position + rotation * Vector3(0, 0.6, 0)
-        clackNode_.worldRotation = rotation
-    end
+    -- 无 3D 行驶声源后无需跟随列车姿态。
 end
 
 ---@param suspended boolean
 function AudioManager.SetSuspended(suspended)
     suspended_ = suspended
-    if suspended then
-        if engineSource_ then engineSource_:SetGain(0) end
-        if clackSource_ then clackSource_:SetGain(0) end
-    end
+    if suspended and ambienceSource_ then ambienceSource_:SetGain(0) end
 end
 
 function AudioManager.GetPowerType() return powerType_ end
-function AudioManager.GetTractionSource() return engineSource_ end
 
 -- ---------------------------------------------------------------------------
 -- 每帧更新
@@ -161,37 +112,7 @@ function AudioManager.GetTractionSource() return engineSource_ end
 ---@param throttle number
 ---@param stationDistance number 距最近车站的距离（米）
 function AudioManager.Update(dt, speedKmh, throttle, stationDistance)
-    local speed = math.abs(speedKmh)
-
-    -- 只更新频率/增益，不每帧 Play 重启循环；电力车没有柴油怠速。
-    if tractionSound_ and engineSource_ then
-        local speedFactor = math.min(1.0, speed / 110.0)
-        local throttleFactor = math.max(0, math.min(1, throttle / 8.0))
-        local pitch, gain
-        if powerType_ == "diesel" then
-            pitch = 0.70 + speedFactor * 0.50 + throttleFactor * 0.45
-            gain = 0.28 + throttleFactor * 0.42 + speedFactor * 0.18
-        else
-            pitch = 0.65 + speedFactor * 0.65 + throttleFactor * 0.25
-            gain = speedFactor * 0.14 + throttleFactor * 0.36
-        end
-        engineSource_:SetFrequency(tractionSound_:GetFrequency() * pitch)
-        engineSource_:SetGain(suspended_ and 0 or gain)
-    end
-
-    -- 轮轨声：速度越快越响
-    if clackSource_ then
-        local clack = _sounds[SFX .. "rail_clack.mp3"]
-        if clack then
-            local gain = 0.0
-            if speed > 3.0 then
-                gain = math.min(0.55, (speed / 90.0) * 0.55)
-            end
-            clackSource_:SetGain(suspended_ and 0 or gain)
-        end
-    end
-
-    -- 站台环境音：进入 260 米内淡入
+    -- 无持续行驶音；只更新站台环境音的距离淡入。
     if ambienceOn_ and ambienceSource_ then
         local target = 0.0
         if stationDistance and stationDistance < 260.0 then
@@ -199,7 +120,7 @@ function AudioManager.Update(dt, speedKmh, throttle, stationDistance)
         end
         local cur = ambienceSource_:GetGain()
         local next_ = cur + (target - cur) * math.min(1.0, dt * 1.6)
-        ambienceSource_:SetGain(next_)
+        ambienceSource_:SetGain(suspended_ and 0 or next_)
     end
 end
 
@@ -251,19 +172,13 @@ function AudioManager.PlayVoice(voiceIndex)
 end
 
 function AudioManager.Shutdown()
-    if engineSource_ then engineSource_:StopImmediate() end
-    if clackSource_ then clackSource_:StopImmediate() end
     if hornSource_ then hornSource_:StopImmediate() end
     if brakeSource_ then brakeSource_:StopImmediate() end
     if ambienceSource_ then ambienceSource_:StopImmediate() end
     if announcerSource_ then announcerSource_:StopImmediate() end
-    if engineNode_ then engineNode_:Remove(); engineNode_:Dispose() end
-    if clackNode_ then clackNode_:Remove(); clackNode_:Dispose() end
     if _audioNode then _audioNode:Dispose() end
-    engineSource_, clackSource_ = nil, nil
     hornSource_, brakeSource_, ambienceSource_, announcerSource_ = nil, nil, nil, nil
-    engineNode_, clackNode_, _audioNode = nil, nil, nil
-    tractionSound_ = nil
+    _audioNode = nil
     ambienceOn_ = false
 end
 

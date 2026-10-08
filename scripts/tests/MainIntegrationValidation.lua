@@ -58,8 +58,8 @@ function Start()
     assert(Hud.GetReadings().paused, "关闭菜单错误清除了用户暂停")
 
     local xp, nextStation = Game.GetXp(), Game.GetNextStation().index
-    local oldSource = assert(Audio.GetTractionSource())
-    assert(audio:GetListener().node == TrainCamera.GetNode(), "3D音效没有绑定当前相机听者")
+    assert(audio:GetListener() and audio:GetListener().node == TrainCamera.GetNode(),
+        "声音监听没有绑定当前相机听者")
     local scene = renderer:GetViewport(0).scene
     local oldRoot = assert(scene:GetChild("Train"))
     local chosen = ""
@@ -76,13 +76,11 @@ function Start()
     assert(Train.GetS() == s and Game.GetXp() == xp and Game.GetNextStation().index == nextStation,
         "换车改变线路位置/经验/站序")
     assert(Train.GetThrottle() == 0 and Train.GetBrake() == 1, "换车没有收油并制动")
-    assert(scene:GetChild("Train") == oldRoot and Audio.GetTractionSource() == oldSource,
-        "换车销毁了稳定根或音频声源")
+    assert(scene:GetChild("Train") == oldRoot, "换车销毁了稳定列车根")
     assert(Audio.GetPowerType() == (Train.GetPowerType() == "diesel" and "diesel" or "electric"),
-        "换车没有切换动力音效")
+        "换车没有同步动力类型")
     local lead = assert(Train.GetLeadNode())
     Audio.SetTrainPose(lead.worldPosition, lead.worldRotation)
-    assert((oldSource.node.worldPosition - lead.worldPosition):Length() < 4, "声音没有跟随头车")
 
     local ok = SelectTrain("unknown_train")
     assert(not ok and Train.GetSelectedId() == chosen, "未知车型改变了当前编组")

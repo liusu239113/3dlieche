@@ -2,6 +2,7 @@
 local Route = require "world.Route"
 local World = require "world.WorldMaterials"
 local Vegetation = require "world.Vegetation"
+local StationBuildings = require "world.StationBuildings"
 local Station = {}
 
 -- 净空截面：现代最大3.38米车体占 [-1.69,+1.69]，站台从 +/-1.90 开始，
@@ -172,11 +173,11 @@ function Station.BuildPlatformSigns(root, st)
     steel:Finish(); boards:Finish()
 end
 
--- 每站仅建一座 14×54 米适中站房，退让出相机摆动空间。
--- 窗格、窗框、窗台、墙基及坡屋顶按材质合并，不为每个部件创建绘制调用。
+-- 每座城市使用各自的原型站房（红墙大屋顶/钟楼/拱门/多层/玻璃枢纽），
+-- 体量、材质、屋顶形态都不同，不再五站共用同一栋楼。
 function Station.BuildBuilding(root, st, matBrick, matCream, matGlass, pause)
-    local D, L, H = 14.0, 54.0, 7.4
-    local radius = math.sqrt(10.2 * 10.2 + 28.0 * 28.0) -- 完整包括屋顶、门廊和基座
+    local style = StationBuildings.Styles[st.index] or StationBuildings.Styles[1]
+    local radius = StationBuildings.FootprintRadius(style)
     local center = point(st, -55, -68, 0)
     local clearance = Route.DistanceTo(center) - radius
     if not Route.CanPlaceFootprint(center, radius, Route.BuildingClearance) then
@@ -187,61 +188,17 @@ function Station.BuildBuilding(root, st, matBrick, matCream, matGlass, pause)
     node.position = center
     local _, _, yaw = Route.Sample(st.s)
     node.rotation = Quaternion(yaw, Vector3.UP)
-    local brick = batch(node, "BrickWalls", matBrick or World.Brick(), true, 1.0)
-    local trim = batch(node, "PlinthLintelsFrames", matCream or World.Concrete(), true, 1)
-    -- 用不透明暗色玻璃避免与后方墙面发生透明排序冲突。
-    local glass = batch(node, "WindowPanes", matGlass or solid(Color(0.16, 0.23, 0.27), 0.22, 0.23), false)
-    local metal = batch(node, "WindowMuntins", solid(Color(0.56, 0.56, 0.51), 0.35, 0.6), true)
-    local roof = batch(node, "PitchedRoof", solid(Color(0.32, 0.23, 0.20), 0.05, 0.93), true)
-    brick:AddBox(Vector3(0, H / 2, 0), Vector3(D, H, L))
-    trim:AddBox(Vector3(0, 0.3, 0), Vector3(D + 0.5, 0.6, L + 0.5))
-    trim:AddBox(Vector3(0, 3.8, 0), Vector3(D + 0.12, 0.12, L + 0.12))
-    trim:AddBox(Vector3(0, H - 0.12, 0), Vector3(D + 0.32, 0.24, L + 0.32))
-    for side = -1, 1, 2 do
-        local x = side * (D / 2 + 0.035)
-        for row = 1, 2 do
-            local y = row == 1 and 2.15 or 5.5
-            for z = -23, 23, 4.6 do
-                if not (side == 1 and row == 1 and math.abs(z) < 4) then
-                    glass:AddBox(Vector3(x, y, z), Vector3(0.04, 1.65, 2.1))
-                    for _, dy in ipairs({ -0.9, 0.9 }) do
-                        trim:AddBox(Vector3(x + side * 0.04, y + dy, z), Vector3(0.14, 0.12, 2.34))
-                    end
-                    for _, dz in ipairs({ -1.10, 1.10 }) do
-                        trim:AddBox(Vector3(x + side * 0.045, y, z + dz), Vector3(0.12, 1.9, 0.10))
-                    end
-                    metal:AddBox(Vector3(x + side * 0.075, y, z), Vector3(0.05, 1.65, 0.045))
-                    metal:AddBox(Vector3(x + side * 0.075, y + 0.1, z), Vector3(0.05, 0.045, 2.1))
-                end
-                if pause then pause() end
-            end
-        end
-    end
-    -- 入口面朝局部 +X，也就是内侧站台方向。
-    glass:AddBox(Vector3(7.065, 1.7, 0), Vector3(0.10, 3.4, 4.2))
-    metal:AddBox(Vector3(7.13, 1.7, 0), Vector3(0.06, 3.4, 0.10))
-    trim:AddBox(Vector3(8.5, 3.8, 0), Vector3(3.0, 0.16, 6.0))
-    for _, z in ipairs({ -2.7, 2.7 }) do
-        metal:AddBox(Vector3(9.8, 1.9, z), Vector3(0.10, 3.8, 0.10))
-    end
-    local x, z, eave, ridge = 7.6, 27.6, H + 0.05, H + 1.85
-    roof:AddQuad(Vector3(-x, eave, -z), Vector3(-x, eave, z), Vector3(0, ridge, z), Vector3(0, ridge, -z))
-    roof:AddQuad(Vector3(0, ridge, -z), Vector3(0, ridge, z), Vector3(x, eave, z), Vector3(x, eave, -z))
-    -- 屋檐薄封边，不用巨大方块伪装屋顶。
-    trim:AddBox(Vector3(-x, eave - 0.05, 0), Vector3(0.10, 0.12, z * 2))
-    trim:AddBox(Vector3(x, eave - 0.05, 0), Vector3(0.10, 0.12, z * 2))
-    brick:AddTri(Vector3(-7, H, -27), Vector3(0, ridge - 0.10, -27), Vector3(7, H, -27))
-    brick:AddTri(Vector3(-7, H, 27), Vector3(7, H, 27), Vector3(0, ridge - 0.10, 27))
-    for _, item in ipairs({brick,trim,glass,metal,roof}) do item:Finish(); if pause then pause() end end
+    StationBuildings.Build(node, style, pause)
     local sign = node:CreateChild("HouseName")
-    sign.position = Vector3(7.22, 6.90, 0)
+    sign.position = Vector3(style.D / 2 + 0.9, style.H * 0.78, 0)
     sign.rotation = Quaternion(-90, Vector3.UP)
     Station.MakeWorldSign(sign, st.name, 0.64)
     placementData_[#placementData_ + 1] = {
         name = st.name, index = st.index, x = center.x, z = center.z, radius = radius, clearance = clearance,
         s = st.s, platformStart = st.s + Route.PlatformStart, platformEnd = st.s + Route.PlatformEnd,
     }
-    print(string.format("[Station] %s 站房完整包络净空 %.2f 米（要求至少 25 米）", st.name, clearance))
+    print(string.format("[Station] %s 站房原型=%s，完整包络净空 %.2f 米（要求至少 25 米）",
+        st.name, style.archetype, clearance))
 end
 
 -- 每站仅六张金属长椅和小型矩形灯具。
