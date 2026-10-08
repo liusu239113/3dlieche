@@ -1,0 +1,33 @@
+{
+  "$schema": "../schemas/project.schema.json",
+  "project_id": "m_2y9f",
+  "author": {
+    "id": "655765888"
+  },
+  "entry": "main.lua",
+  "version": "1.0.0",
+  "taptap_publish": {
+    "title": "火车驾驶模拟",
+    "description": "",
+    "category": "simulation",
+    "screen_orientation": "landscape",
+    "collection_type": "simulation",
+    "trial_note": "",
+    "app_platforms": "1,2",
+    "developer_id": 403350,
+    "app_id": 962369,
+    "miniapp_id": "tapmcl9xqmlid9ubhp"
+  },
+  "assets": {
+    "icon": "",
+    "screenshots": [],
+    "promotional_image": ""
+  },
+  "metadata": {
+    "updated_at": "2026-10-06T13:55:52.075Z"
+  },
+  "test_qrcode": {
+    "url": "https://tapcode-sce.spark.xd.com/qrcode/m_2y9f_1791294951968.png",
+    "generated_at": "2026-10-06T13:55:52.075Z"
+  }
+}

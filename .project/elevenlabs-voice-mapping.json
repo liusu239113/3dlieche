@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "provider": "elevenlabs",
+  "default_language": "cmn",
+  "default_stability": 0.5,
+  "characters": {
+    "车站广播员": {
+      "voice_id": "zCBAatjWp22hVkvaEDFX",
+      "voice_name": "车站广播员_voice",
+      "description": "Voice Design - Young adult female in her 20s, clear bright broadcast tone with warm resonance, professional announcer quality, steady measured pacing with crisp articulation, calm authoritative yet friendly and reassuring, Chinese railway station PA announcement style, elegant and composed, studio-quality recording, professional audio, clear articulation.",
+      "language": "cmn",
+      "stability": 0.5,
+      "created_at": "2026-10-06T09:39:22.229Z",
+      "last_used": "2026-10-06T09:39:22.229Z"
+    }
+  },
+  "special_voices": {}
+}
