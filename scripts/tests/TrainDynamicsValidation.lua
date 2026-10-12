@@ -26,7 +26,8 @@ function Start()
         Train.Build(scene_)
         local loadSeconds = os.clock() - started
         check(Train.GetSelectedId() == "CR400AF", "default fell back")
-        check(RollingStock.IsReady("CR400AF_head") and RollingStock.IsReady("CR400AF_middle"), "default not loaded")
+        check(RollingStock.IsReady("CR400AF_head") and RollingStock.IsReady("CR400AF_middle_v2"), "default not loaded")
+        check(not RollingStock.IsReady("CR400AF_middle"), "rejected old middle loaded at startup")
         check(not RollingStock.IsReady("DF4D") and not RollingStock.IsReady("CRH380A_head"), "unselected models prepared")
         local menu = Train.GetCatalog()
         check(#menu == #Catalog.Entries, "catalog incomplete")
@@ -35,7 +36,9 @@ function Start()
         local report = {"DEFAULT_ONLY_LOAD_PASS seconds=" .. tostring(loadSeconds)}
         local dt = .05
         for _, entry in ipairs(Catalog.Entries) do
-            Train.Reset(0)
+            -- 开放线路从首站开始测原SI动力；不再从s=0冲出端点，也不把休闲倍增当真实参数。
+            Train.Reset(Route.GetStations()[1].s + 1)
+            assert(Train.SetDrivingMode("simulation"))
             local selected, selectedMessage = Train.Select(entry.id)
             check(selected, selectedMessage)
             check(Train.GetOperatingSpeedKmh() == entry.operatingSpeedKmh, "operating speed mismatch")
@@ -93,6 +96,6 @@ function Start()
         for _, line in ipairs(report) do check(file:WriteLine(line), "report cannot write") end
         file:Close()
     end)
-    if not ok then print("[Dynamics] FAIL " .. tostring(message)) end
+    if not ok then error("[Dynamics] FAIL " .. tostring(message)) end
     engine:Exit()
 end

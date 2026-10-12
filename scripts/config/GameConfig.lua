@@ -3,25 +3,41 @@
 -- 单位：米、秒、千克
 -- ============================================================================
 
+local FictionalWorld = require "config.FictionalWorld"
 local GameConfig = {}
 
-GameConfig.Title = "火车驾驶模拟"
+GameConfig.Title = FictionalWorld.name .. " · 铁路旅程"
+
+-- 默认先保障移动端负载；细致模式保留近景阴影与镜面，不影响运营逻辑或资源完整性。
+GameConfig.RenderQuality = "performance"
 
 -- ---------------------------------------------------------------------------
--- 线路：圆角矩形环线（可无限循环驾驶）
--- 由直线段和圆弧段拼成，最后闭合
+-- 线路：有端点的五站走廊，左右交替曲线，不再首尾闭合。
+-- 星澜群域的五座架空城市；名称、线路与运营规则不映射现实铁路。
 -- ---------------------------------------------------------------------------
--- 大半径演示环线：12/10公里长直线，R=9000米圆弧。
--- 用于高速驾驶模拟；未实现真实线路超高/缓和曲线认证。
+GameConfig.RouteClosed = false
 GameConfig.RouteSegments = {
-    { type = "straight", length = 12000 },
-    { type = "arc", radius = 9000, angle = 90, dir = 1 },
-    { type = "straight", length = 10000 },
-    { type = "arc", radius = 9000, angle = 90, dir = 1 },
-    { type = "straight", length = 12000 },
-    { type = "arc", radius = 9000, angle = 90, dir = 1 },
-    { type = "straight", length = 10000 },
-    { type = "arc", radius = 9000, angle = 90, dir = 1 },
+    { type="straight",length=2200 },
+    { type="arc",radius=1600,angle=32,dir=1 },
+    { type="straight",length=1300,landmark="bridge_a" },
+    { type="arc",radius=1000,angle=42,dir=-1 },
+    { type="straight",length=2300 },
+    { type="arc",radius=1800,angle=35,dir=1 },
+    { type="straight",length=2400,landmark="tunnel_a" },
+    { type="arc",radius=1200,angle=48,dir=-1 },
+    { type="straight",length=2200 },
+    { type="arc",radius=2200,angle=26,dir=1 },
+    { type="straight",length=2000 },
+    { type="arc",radius=1400,angle=44,dir=-1 },
+    { type="straight",length=2500,landmark="tunnel_b" },
+    { type="arc",radius=1100,angle=40,dir=1 },
+    { type="straight",length=2100 },
+    { type="arc",radius=2000,angle=30,dir=-1 },
+    { type="straight",length=1600,landmark="bridge_b" },
+    { type="arc",radius=1600,angle=38,dir=1 },
+    { type="straight",length=2300 },
+    { type="arc",radius=2400,angle=24,dir=-1 },
+    { type="straight",length=2600 },
 }
 
 GameConfig.RouteStart = Vector3(0, 0, 0)
@@ -34,18 +50,24 @@ GameConfig.WorldStream = {
     MaxTaskSlices = 32,
     RefreshInterval = 0.20,
     TrackChunkLength = 120,
-    DetailAhead = 960,
-    DetailBehind = 600,
-    ViewAhead = 3000,
-    ViewBehind = 2800,
+    DetailAhead = 480,
+    DetailBehind = 360,
+    ViewAhead = 2400,
+    ViewBehind = 1800,
     UnloadMargin = 720,
     InitialDetailAhead = 240,
     InitialDetailBehind = 240,
     InitialInfrastructureRadius = 96,
-    InfrastructureChunkLength = 32,
+    -- 4个旧32m设施块合为128m空间批；导线/护栏原采样不变，协程仍逐段让出。
+    InfrastructureChunkLength = 128,
     InfrastructureAhead = 1500,
     InfrastructureBehind = 1100,
     StationRadius = 2800,
+    CityRadius = 2100,
+    SceneryChunkLength = 240,
+    SceneryAhead = 1600,
+    SceneryBehind = 1200,
+    InitialSceneryRadius = 240,
     TerrainCellSize = 160,
     TerrainRadius = 1120,
     VegetationRadius = 360,
@@ -66,11 +88,11 @@ GameConfig.RailHeight = 0.20      -- 轨面离地高
 -- 车站（at = 在线路上的位置比例 0~1）
 -- ---------------------------------------------------------------------------
 GameConfig.Stations = {
-    { name = "北京站", at = 0.100 },
-    { name = "天津站", at = 0.300 },
-    { name = "济南站", at = 0.500 },
-    { name = "南京站", at = 0.700 },
-    { name = "上海站", at = 0.900 },
+    { name = FictionalWorld.stationNames[1], at = 0.025 },
+    { name = FictionalWorld.stationNames[2], at = 0.270 },
+    { name = FictionalWorld.stationNames[3], at = 0.540 },
+    { name = FictionalWorld.stationNames[4], at = 0.735 },
+    { name = FictionalWorld.stationNames[5], at = 0.960 },
 }
 
 -- ---------------------------------------------------------------------------
@@ -110,7 +132,10 @@ GameConfig.Gameplay = {
     BrakeReactionSeconds = 1.5,    -- 制动提示与速度包络的反应余量
     StationBrakeDistance = 900,    -- 兼容旧接口；实际提示按 v²/(2a) 动态计算
     StopTolerance = 60,            -- 停车精度容差（米）
-    DwellTime = 20,                -- 站停时间（秒）
+    DwellTime = 12,                -- 站停时间（秒）
+    DrivingMode = "relaxed",       -- 休闲牵引默认更敏捷；可切换保持原SI参数的模拟模式
+    RelaxedTractiveScale = 1.65,
+    RelaxedPowerScale = 2.8,
     XpPerStation = 100,            -- 每站经验
     XpSpeedBonus = 50,             -- 准点/精准停车奖励
 }

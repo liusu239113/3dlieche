@@ -1,0 +1,821 @@
+{
+  "world": "星澜群域",
+  "operator": "群域行旅联队",
+  "symbol": "双棱航迹",
+  "provenance": "Derived from existing supplied atlases; not original new models. No external upload or AI regeneration.",
+  "method": "Local Pillow + masked OpenCV inpaint; no geometry, UV, material lifecycle or source-asset modification.",
+  "runtimeVerification": "Requires unified official build and in-game preview; texture-space inspection alone is not final rendered acceptance.",
+  "textures": [
+    {
+      "name": "Cangyu_D12",
+      "displayCode": "D12",
+      "source": "model/228b03702ab649048d477f0df9bf5feb/Textures/228b03702ab649048d477f0df9bf5feb_00_D.jpg",
+      "sourceSHA256": "b7fff6fad26fdc7d42bce94fc1671eed0adee41570d76e7ce6d92d2f7d2814f6",
+      "normalSource": "model/228b03702ab649048d477f0df9bf5feb/Textures/228b03702ab649048d477f0df9bf5feb_00_N.png",
+      "normalSourceSHA256": "a12f496963b2d7fdb02527e594615857bef8b38c69607b55e294af1ead708db2",
+      "diffuse": "FictionalLiveries/Cangyu_D12_D.png",
+      "normal": "FictionalLiveries/Cangyu_D12_N.png",
+      "dimensions": [
+        2048,
+        2048
+      ],
+      "normalDimensions": [
+        2048,
+        2048
+      ],
+      "clearingPolygons": [
+        [
+          [
+            1060,
+            927
+          ],
+          [
+            1096,
+            927
+          ],
+          [
+            1096,
+            970
+          ],
+          [
+            1060,
+            970
+          ]
+        ]
+      ],
+      "markedPixels": 1628,
+      "paintPixels": 670928,
+      "changedDiffusePixels": 671858,
+      "changedNormalPixels": 1540,
+      "operation": "Old nose symbol cleared in D and N; saturated blue paint becomes sea teal. Original yellow stripe remains a warm-gold accent."
+    },
+    {
+      "name": "Chiluan_D18",
+      "displayCode": "D18",
+      "source": "RollingStockBaked/DF4D_D.jpg",
+      "sourceSHA256": "9d893227893c0c20085313b46881097b7e5829e862d1153494861292c1f19ffe",
+      "normalSource": "RollingStockBaked/DF4D_N.png",
+      "normalSourceSHA256": "d6ed727999fb00ab966935e5451434997be1a17dbd750859a689affc63ffd08c",
+      "diffuse": "FictionalLiveries/Chiluan_D18_D.png",
+      "normal": "FictionalLiveries/Chiluan_D18_N.png",
+      "dimensions": [
+        2048,
+        2048
+      ],
+      "normalDimensions": [
+        2048,
+        2048
+      ],
+      "clearingPolygons": [
+        [
+          [
+            105,
+            1182
+          ],
+          [
+            132,
+            1182
+          ],
+          [
+            132,
+            1208
+          ],
+          [
+            105,
+            1208
+          ]
+        ],
+        [
+          [
+            791,
+            1203
+          ],
+          [
+            825,
+            1196
+          ],
+          [
+            833,
+            1228
+          ],
+          [
+            796,
+            1237
+          ]
+        ]
+      ],
+      "markedPixels": 2017,
+      "paintPixels": 993004,
+      "changedDiffusePixels": 993004,
+      "changedNormalPixels": 2017,
+      "operation": "Two real/source red technical plates removed, copper-red paint remapped while grilles, cab glass, cream stripe, underframe and all UV islands remain."
+    },
+    {
+      "name": "Cangqiong_E21",
+      "displayCode": "E21",
+      "source": "RollingStockBaked/SS9G_D.jpg",
+      "sourceSHA256": "47e8187bb19228db128112960ec72ef868350b556e6a5077e3e0958b931d8552",
+      "normalSource": "RollingStockBaked/SS9G_N.png",
+      "normalSourceSHA256": "f29b85bbb4d3e5bc5ba70312a8a8d39f32f9b77128968c81a605554fdf6752cd",
+      "diffuse": "FictionalLiveries/Cangqiong_E21_D.png",
+      "normal": "FictionalLiveries/Cangqiong_E21_N.png",
+      "dimensions": [
+        2048,
+        2048
+      ],
+      "normalDimensions": [
+        2048,
+        2048
+      ],
+      "clearingPolygons": [
+        [
+          [
+            399,
+            1114
+          ],
+          [
+            490,
+            1114
+          ],
+          [
+            490,
+            1166
+          ],
+          [
+            399,
+            1166
+          ]
+        ],
+        [
+          [
+            38,
+            1370
+          ],
+          [
+            81,
+            1370
+          ],
+          [
+            81,
+            1460
+          ],
+          [
+            38,
+            1460
+          ]
+        ],
+        [
+          [
+            1037,
+            482
+          ],
+          [
+            1065,
+            482
+          ],
+          [
+            1065,
+            493
+          ],
+          [
+            1037,
+            493
+          ]
+        ]
+      ],
+      "markedPixels": 9228,
+      "paintPixels": 1153460,
+      "changedDiffusePixels": 1153871,
+      "changedNormalPixels": 9228,
+      "operation": "Unreadable cyan nameplate/source lettering and small plates cleared; red body becomes indigo, original glazing/doors/cream stripe/roof retained."
+    },
+    {
+      "name": "Leisun_E32",
+      "displayCode": "E32",
+      "source": "RollingStockBaked/HXD3D_D.jpg",
+      "sourceSHA256": "20feee278a44eed68426080367bfff3aa389639d1d55ff35d8b5a723972ca496",
+      "normalSource": "RollingStockBaked/HXD3D_N.png",
+      "normalSourceSHA256": "7fff5819ecdb99ac8ce6ff8a62beb0215ab59c3d0577f93f7f477e08d522490a",
+      "diffuse": "FictionalLiveries/Leisun_E32_D.png",
+      "normal": "FictionalLiveries/Leisun_E32_N.png",
+      "dimensions": [
+        2048,
+        2048
+      ],
+      "normalDimensions": [
+        2048,
+        2048
+      ],
+      "clearingPolygons": [
+        [
+          [
+            74,
+            1338
+          ],
+          [
+            101,
+            1338
+          ],
+          [
+            101,
+            1375
+          ],
+          [
+            74,
+            1375
+          ]
+        ],
+        [
+          [
+            118,
+            1325
+          ],
+          [
+            151,
+            1325
+          ],
+          [
+            151,
+            1377
+          ],
+          [
+            118,
+            1377
+          ]
+        ],
+        [
+          [
+            126,
+            1408
+          ],
+          [
+            148,
+            1408
+          ],
+          [
+            148,
+            1428
+          ],
+          [
+            126,
+            1428
+          ]
+        ],
+        [
+          [
+            33,
+            1420
+          ],
+          [
+            55,
+            1420
+          ],
+          [
+            55,
+            1440
+          ],
+          [
+            33,
+            1440
+          ]
+        ],
+        [
+          [
+            30,
+            1606
+          ],
+          [
+            121,
+            1606
+          ],
+          [
+            121,
+            1653
+          ],
+          [
+            30,
+            1653
+          ]
+        ],
+        [
+          [
+            20,
+            1710
+          ],
+          [
+            47,
+            1710
+          ],
+          [
+            47,
+            1742
+          ],
+          [
+            20,
+            1742
+          ]
+        ],
+        [
+          [
+            161,
+            1482
+          ],
+          [
+            201,
+            1482
+          ],
+          [
+            201,
+            1539
+          ],
+          [
+            161,
+            1539
+          ]
+        ],
+        [
+          [
+            548,
+            1404
+          ],
+          [
+            562,
+            1404
+          ],
+          [
+            562,
+            1424
+          ],
+          [
+            548,
+            1424
+          ]
+        ],
+        [
+          [
+            576,
+            1370
+          ],
+          [
+            604,
+            1370
+          ],
+          [
+            604,
+            1417
+          ],
+          [
+            576,
+            1417
+          ]
+        ],
+        [
+          [
+            624,
+            1352
+          ],
+          [
+            654,
+            1352
+          ],
+          [
+            654,
+            1428
+          ],
+          [
+            624,
+            1428
+          ]
+        ],
+        [
+          [
+            1006,
+            1062
+          ],
+          [
+            1049,
+            1080
+          ],
+          [
+            1040,
+            1102
+          ],
+          [
+            1004,
+            1089
+          ]
+        ],
+        [
+          [
+            970,
+            1100
+          ],
+          [
+            1029,
+            1120
+          ],
+          [
+            1017,
+            1148
+          ],
+          [
+            965,
+            1130
+          ]
+        ],
+        [
+          [
+            932,
+            1650
+          ],
+          [
+            958,
+            1650
+          ],
+          [
+            958,
+            1695
+          ],
+          [
+            932,
+            1695
+          ]
+        ],
+        [
+          [
+            1000,
+            1652
+          ],
+          [
+            1026,
+            1652
+          ],
+          [
+            1026,
+            1693
+          ],
+          [
+            1000,
+            1693
+          ]
+        ],
+        [
+          [
+            985,
+            1665
+          ],
+          [
+            1003,
+            1665
+          ],
+          [
+            1003,
+            1689
+          ],
+          [
+            985,
+            1689
+          ]
+        ],
+        [
+          [
+            1045,
+            1903
+          ],
+          [
+            1069,
+            1903
+          ],
+          [
+            1069,
+            1930
+          ],
+          [
+            1045,
+            1930
+          ]
+        ],
+        [
+          [
+            74,
+            1950
+          ],
+          [
+            100,
+            1950
+          ],
+          [
+            100,
+            1991
+          ],
+          [
+            74,
+            1991
+          ]
+        ],
+        [
+          [
+            105,
+            1950
+          ],
+          [
+            128,
+            1950
+          ],
+          [
+            128,
+            1983
+          ],
+          [
+            105,
+            1983
+          ]
+        ],
+        [
+          [
+            128,
+            1940
+          ],
+          [
+            151,
+            1940
+          ],
+          [
+            151,
+            2020
+          ],
+          [
+            128,
+            2020
+          ]
+        ],
+        [
+          [
+            165,
+            1945
+          ],
+          [
+            207,
+            1945
+          ],
+          [
+            207,
+            2022
+          ],
+          [
+            165,
+            2022
+          ]
+        ]
+      ],
+      "markedPixels": 29219,
+      "paintPixels": 907854,
+      "changedDiffusePixels": 907854,
+      "changedNormalPixels": 29219,
+      "operation": "All observed CRH/HCD/railway/manufacturer-like symbols, source fleet numbers and source technical lettering are separately masked in D/N. Purple paint is selective; windows, white stripes and hardware remain."
+    },
+    {
+      "name": "Liuying_M30_head",
+      "displayCode": "M30",
+      "source": "RollingStockBaked/CRH380A_head_D.jpg",
+      "sourceSHA256": "b8499298c8c01e3d8ded1025de40474d1859b249c9ca52a11a57ddcef1b7d9b0",
+      "normalSource": "RollingStockBaked/CRH380A_head_N.png",
+      "normalSourceSHA256": "67473058610a869ba7fb31987dad06a3d4d91e73a48b83bd429fb5ed714efef1",
+      "diffuse": "FictionalLiveries/Liuying_M30_head_D.png",
+      "normal": "FictionalLiveries/Liuying_M30_head_N.png",
+      "dimensions": [
+        2048,
+        2048
+      ],
+      "normalDimensions": [
+        2048,
+        2048
+      ],
+      "clearingPolygons": [
+        [
+          [
+            736,
+            731
+          ],
+          [
+            781,
+            729
+          ],
+          [
+            782,
+            749
+          ],
+          [
+            736,
+            751
+          ]
+        ],
+        [
+          [
+            500,
+            1350
+          ],
+          [
+            524,
+            1350
+          ],
+          [
+            524,
+            1389
+          ],
+          [
+            500,
+            1389
+          ]
+        ]
+      ],
+      "markedPixels": 1933,
+      "paintPixels": 80630,
+      "changedDiffusePixels": 82587,
+      "changedNormalPixels": 1933,
+      "operation": "Small nose lettering/emblem and side lettering removed from color and embossed normal map; blue stripes become green-teal without repainting white body, glass or doors."
+    },
+    {
+      "name": "Liuying_M30_middle",
+      "displayCode": "M30",
+      "source": "RollingStockBaked/CRH380A_middle_D.jpg",
+      "sourceSHA256": "24d295cb13023a83769fa8c895e6681c8a7b6fea4641b3fccd4dc69530fd73ae",
+      "normalSource": "RollingStockBaked/CRH380A_middle_N.png",
+      "normalSourceSHA256": "b9048bdd6e4d3b6f53126f1e5ad8a58af82a3ed8d4442b6fe44a87febd107d7b",
+      "diffuse": "FictionalLiveries/Liuying_M30_middle_D.png",
+      "normal": "FictionalLiveries/Liuying_M30_middle_N.png",
+      "dimensions": [
+        2048,
+        2048
+      ],
+      "normalDimensions": [
+        2048,
+        2048
+      ],
+      "clearingPolygons": [
+        [
+          [
+            423,
+            1418
+          ],
+          [
+            472,
+            1369
+          ],
+          [
+            607,
+            1504
+          ],
+          [
+            558,
+            1553
+          ]
+        ],
+        [
+          [
+            693,
+            1230
+          ],
+          [
+            724,
+            1199
+          ],
+          [
+            841,
+            1316
+          ],
+          [
+            810,
+            1347
+          ]
+        ]
+      ],
+      "markedPixels": 20818,
+      "paintPixels": 82468,
+      "changedDiffusePixels": 103299,
+      "changedNormalPixels": 20818,
+      "operation": "Two large CRH text/logo groups removed in D and embossed N using narrow diagonal masks between window/blue/grey bands; replaced with independent double-diamond symbols and M30, keeping every window and door UV."
+    },
+    {
+      "name": "Xinglan_M35_head",
+      "displayCode": "M35",
+      "source": "RollingStockBaked/CR400AF_head_D.jpg",
+      "sourceSHA256": "ef20302074f266e5f5c061fcd3109b264cef74c98846e7e9551d9212abbcf780",
+      "normalSource": "RollingStockBaked/CR400AF_head_N.png",
+      "normalSourceSHA256": "794095e2687e1bffcba14ed75dac4f14d578f1d0e965c20797643f59289f3932",
+      "diffuse": "FictionalLiveries/Xinglan_M35_head_D.png",
+      "normal": "FictionalLiveries/Xinglan_M35_head_N.png",
+      "dimensions": [
+        2048,
+        2048
+      ],
+      "normalDimensions": [
+        2048,
+        2048
+      ],
+      "clearingPolygons": [
+        [
+          [
+            415,
+            1573
+          ],
+          [
+            455,
+            1573
+          ],
+          [
+            455,
+            1619
+          ],
+          [
+            415,
+            1619
+          ]
+        ]
+      ],
+      "markedPixels": 1927,
+      "paintPixels": 92863,
+      "changedDiffusePixels": 93182,
+      "changedNormalPixels": 1927,
+      "operation": "Nose source railway emblem removed in D/N; red speed ribbon becomes violet-blue, thin teal accent and window/door masks retained."
+    },
+    {
+      "name": "Xinglan_M35_middle",
+      "displayCode": "M35",
+      "source": "RollingStockBaked/CR400AF_middle_v2_aligned_D.png",
+      "sourceSHA256": "219a7a5676d34cd605a6e5b7b8109a6a3d22776c1097122471451e74a3e3972e",
+      "normalSource": "model/fb6db791acae4c95a0455e5270f4e417/Textures/fb6db791acae4c95a0455e5270f4e417_00_N.png",
+      "normalSourceSHA256": "a44ae37c15030e547b60e84c65d793892740eaf84bf4d63f8a7dd0e343839734",
+      "diffuse": "FictionalLiveries/Xinglan_M35_middle_D.png",
+      "normal": "FictionalLiveries/Xinglan_M35_middle_N.png",
+      "dimensions": [
+        4096,
+        4096
+      ],
+      "normalDimensions": [
+        4096,
+        4096
+      ],
+      "clearingPolygons": [],
+      "markedPixels": 0,
+      "paintPixels": 72614,
+      "changedDiffusePixels": 73877,
+      "changedNormalPixels": 0,
+      "operation": "Accepted v2 diffuse inspected: no legible real brand found. Selective violet-blue ribbon replaces red only; central black window strip, all doors, side panels and vents stay unchanged."
+    },
+    {
+      "name": "Xinglan_M35_spare",
+      "displayCode": "M35",
+      "source": "RollingStockBaked/CR400AF_middle_D.jpg",
+      "sourceSHA256": "54ffc64ec49f8138912e6d4e6f25e85e34125f99472c25abdde311ea0af6cfda",
+      "normalSource": "RollingStockBaked/CR400AF_middle_N.png",
+      "normalSourceSHA256": "9525a311840744ed82979ccf92d35e2d71b45cbfd5b436c0c201fb4f40232524",
+      "diffuse": "FictionalLiveries/Xinglan_M35_spare_D.png",
+      "normal": "FictionalLiveries/Xinglan_M35_spare_N.png",
+      "dimensions": [
+        2048,
+        2048
+      ],
+      "normalDimensions": [
+        2048,
+        2048
+      ],
+      "clearingPolygons": [
+        [
+          [
+            1213,
+            1536
+          ],
+          [
+            1259,
+            1534
+          ],
+          [
+            1260,
+            1556
+          ],
+          [
+            1215,
+            1558
+          ]
+        ]
+      ],
+      "markedPixels": 1028,
+      "paintPixels": 190904,
+      "changedDiffusePixels": 191932,
+      "changedNormalPixels": 1028,
+      "operation": "Inactive/rejected spare atlas also gets source plate removal and violet ribbon; not promoted to service and no geometric claims changed."
+    },
+    {
+      "name": "Yunzhou_C24_detail",
+      "source": "Textures/Railway/coach_detail.png",
+      "sourceSHA256": "1eec017e4ae760932ebc48d0b0f9201a7411b8bb6fc374b6410d4da8c3021655",
+      "diffuse": "FictionalLiveries/Yunzhou_C24_detail_D.png",
+      "dimensions": [
+        1024,
+        1024
+      ],
+      "operation": "Removed YZ 25K/SERVICE 25K, rebuilt fictional QY/C24 nameplates only; retained equipment louvers and diamond-tread tile unchanged."
+    }
+  ]
+}

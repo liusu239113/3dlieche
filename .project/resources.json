@@ -12,17 +12,24 @@
     ],
     "rolling_stock_start": [
       "RollingStockBaked/CR400AF_head.mdl",
-      "RollingStockBaked/CR400AF_middle.mdl",
+      "RollingStockBaked/CR400AF_middle_v2.mdl",
       "RollingStockBaked/CR400AF_head.json",
-      "RollingStockBaked/CR400AF_middle.json",
+      "RollingStockBaked/CR400AF_middle_v2.json",
       "RollingStockBaked/CR400AF_head_D.jpg",
       "RollingStockBaked/CR400AF_head_N.png",
-      "RollingStockBaked/CR400AF_middle_D.jpg",
-      "RollingStockBaked/CR400AF_middle_N.png"
+      "RollingStockBaked/CR400AF_middle_v2_aligned_D.png",
+      "model/fb6db791acae4c95a0455e5270f4e417/Textures/fb6db791acae4c95a0455e5270f4e417_00_N.png"
     ],
     "environment_start": [
       "Textures/Skybox.xml",
-      "Textures/Skybox.ktx"
+      "Textures/Skybox.ktx",
+      "Textures/Railway/grass.png",
+      "Textures/Railway/brick.png",
+      "Textures/Railway/concrete.png",
+      "model/53b7b1c43a014392b3160d16892893c2/Textures/53b7b1c43a014392b3160d16892893c2_00_D.jpg",
+      "model/53b7b1c43a014392b3160d16892893c2/Textures/53b7b1c43a014392b3160d16892893c2_00_N.png",
+      "model/3b9e3d894594475abed30d7f58e67003/Textures/3b9e3d894594475abed30d7f58e67003_00_D.jpg",
+      "model/3b9e3d894594475abed30d7f58e67003/Textures/3b9e3d894594475abed30d7f58e67003_00_N.png"
     ]
   }
 }

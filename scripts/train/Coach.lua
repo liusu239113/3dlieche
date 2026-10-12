@@ -1,12 +1,15 @@
 -- ============================================================================
--- Coach - 蓝白现实结构客车，长24米，基于 core.MeshUtils.GeoBuilder。
+-- Coach - 星澜群域云舟 C24 客车，长24米，基于 core.MeshUtils.GeoBuilder。
 -- 局部+Z为前端，Y向上，单位为米。父节点原点为线路基准而非轨面。
--- 轨面y=.34、轮心y=.80、踏面半径=.46；静态重复部件按材质合批。
+-- 轨面y=.34、轮心y=.80、踏面半径=.46；静态重复部件按材质合批并共享Model。
 -- 仅转向架和车轮需要运动。窗洞真实留空，玻璃后面不存在白色整盒。
+-- 首次按需烘焙内存样板，后续Build不重复生成网格；没有新增客室/车型专属内饰。
 -- ============================================================================
 
 local MeshUtils = require "core.MeshUtils"
 local Materials = require "config.Materials"
+local FictionalWorld = require "config.FictionalWorld"
+local CoachLiveries = require "config.CoachLiveries"
 
 ---@class CoachBogie
 ---@field node Node 枢轴位于局部(0,0,z)，子部件高度采用线路基准。
@@ -44,6 +47,7 @@ Coach.AxleSpacing = 2.40
 ---@class CoachMaterials
 ---@field white Material
 ---@field blue Material
+---@field stripe Material 车队特征条与车门色
 ---@field roof Material
 ---@field dark Material
 ---@field steel Material
@@ -51,8 +55,26 @@ Coach.AxleSpacing = 2.40
 ---@field glass Material
 ---@field detail Material
 
----@type CoachMaterials?
-local materialCache = nil
+---@type table<string, CoachMaterials>
+local materialCache = {}
+---@type CoachLivery
+local livery_ = CoachLiveries.Get(CoachLiveries.Fallback)
+
+---@class CoachSharedMesh
+---@field name string
+---@field model Model
+---@field material Material
+---@field shadows boolean
+---@field vertices integer
+
+-- Model持有FillModel导出的缓冲，模块再强持有Model；销毁车辆节点不能Dispose共享模型。
+-- 缓存只有首节/普通车体、同型转向架和左右轮，不持有Scene或已销毁的车辆节点。
+---@type table<string, CoachSharedMesh[]>
+local bodyCache = {}
+---@type CoachSharedMesh[]
+local bogieCache = {}
+---@type table<number, CoachSharedMesh>
+local wheelCache = {}
 
 ---@class CoachBatches
 ---@field white GeoBuilder
@@ -63,6 +85,9 @@ local materialCache = nil
 ---@field rubber GeoBuilder
 ---@field glass GeoBuilder
 ---@field detail GeoBuilder
+---@field stripe GeoBuilder 车队特征条
+---@field door GeoBuilder 车门扇
+---@field accent GeoBuilder 点缀件
 
 ---@return CoachBatches
 local function NewBatches()
@@ -71,6 +96,8 @@ local function NewBatches()
         roof = MeshUtils.NewBuilder(), dark = MeshUtils.NewBuilder(),
         steel = MeshUtils.NewBuilder(), rubber = MeshUtils.NewBuilder(),
         glass = MeshUtils.NewBuilder(), detail = MeshUtils.NewBuilder(),
+        stripe = MeshUtils.NewBuilder(), door = MeshUtils.NewBuilder(),
+        accent = MeshUtils.NewBuilder(),
     }
 end
 
@@ -113,22 +140,31 @@ end
 
 ---@return CoachMaterials
 local function GetMaterials()
-    if materialCache then return materialCache end
+    local cached = materialCache[livery_.id]
+    if cached then return cached end
     local paint = "Textures/Railway/coach_paint.png"
     local normal = "Textures/Railway/coach_paint_normal.png"
     local steel = "Textures/Railway/coach_steel.png"
-    materialCache = {
-        white = Textured(paint, Color(.87, .90, .91), .05, .43, normal),
-        blue = Textured(paint, Color(.12, .26, .43), .07, .40, normal),
-        roof = Textured(steel, Color(.71, .74, .75), .38, .56),
+    local l = livery_
+    ---@param v number[]
+    ---@return number, number, number
+    local function rgb(v) return assert(v[1]), assert(v[2]), assert(v[3]) end
+    local materials = {
+        white = Textured(paint, Color(rgb(l.body)), .05, .43, normal),
+        blue = Textured(paint, Color(rgb(l.skirt)), .07, .40, normal),
+        stripe = Textured(paint, Color(rgb(l.stripe)), .10, .38, normal),
+        roof = Textured(steel, Color(rgb(l.roof)), .38, .56),
         dark = Textured(steel, Color(.18, .20, .21), .30, .68),
         steel = Textured(steel, Color(.66, .70, .72), .75, .37),
         rubber = Materials.Solid(Color(.038, .045, .050), 0, .89),
         -- 真实窗洞中的不透明深色玻璃，避免透明排序及白色衬底。
         glass = Textured("Textures/Railway/coach_glass.png", Color(1, 1, 1), .12, .16, nil, true),
-        detail = Textured("Textures/Railway/coach_detail.png", Color(.95, .97, .97), .12, .60, nil, true),
+        detail = Textured("FictionalLiveries/Yunzhou_C24_detail_D.png", Color(.95, .97, .97), .12, .60, nil, true),
+        door = Textured(paint, Color(rgb(l.door)), .08, .41, normal),
+        accent = Textured(paint, Color(rgb(l.accent)), .16, .36, normal),
     }
-    return materialCache
+    materialCache[livery_.id] = materials
+    return materials
 end
 
 -- 利用MeshUtils标准构建器的顶点法线/UV数组做局部扩展，
@@ -172,12 +208,14 @@ end
 ---@param finish Vector3
 ---@param radius number
 ---@param segments? integer
-local function Rod(b, start, finish, radius, segments)
+---@param caps? boolean 相邻弹簧段省略被遮住的内部端盖，首尾段仍封口。
+local function Rod(b, start, finish, radius, segments, caps)
     local axis = (finish - start):Normalized()
     local reference = math.abs(axis.y) > .9 and Vector3.RIGHT or Vector3.UP
     local u = axis:CrossProduct(reference):Normalized()
     local v = axis:CrossProduct(u):Normalized()
-    local count = segments or 8
+    -- 亚厘米扶手无需12/14边；保留输入的更低分段和圆柱半径，不变成方盒。
+    local count = math.min(segments or 8, radius >= .08 and 8 or 6)
     for i = 1, count do
         local t0, t1 = (i - 1) * 2 * math.pi / count, i * 2 * math.pi / count
         local n0 = u * math.cos(t0) + v * math.sin(t0)
@@ -188,41 +226,86 @@ local function Rod(b, start, finish, radius, segments)
         QuadUV(b, a, e, d, c, (i - 1) / count, 0, i / count, (finish - start):Length() * 2)
         b.norms[first + 1], b.norms[first + 2], b.norms[first + 3] = n0, n1, n1
         b.norms[first + 4], b.norms[first + 5], b.norms[first + 6] = n0, n1, n0
-        b:AddTri(start, e, a)
-        b:AddTri(finish, c, d)
+        if caps ~= false then
+            b:AddTri(start, e, a)
+            b:AddTri(finish, c, d)
+        end
     end
 end
 
+-- 沿现有GeoBuilder一次性生成样板，再由引擎FillModel导出完整法线/UV/切线。
+-- 不用GetVertex改指针字段，不手写索引布局；后续Build只复用Model，不能Clone复制VB。
 ---@param b GeoBuilder
----@param parent Node
 ---@param name string
 ---@param material Material
 ---@param shadows? boolean
----@return integer
-local function Submit(b, parent, name, material, shadows)
-    if b:Count() == 0 then return 0 end
-    local child = parent:CreateChild(name)
-    local count = b:CommitTo(child, material)
-    local geometry = child:GetComponent("CustomGeometry")
-    geometry.castShadows = shadows ~= false
-    geometry.viewMask = 1
-    return count
+---@return CoachSharedMesh
+local function BakeMesh(b, name, material, shadows)
+    local count = b:Count()
+    assert(count > 0 and count % 3 == 0, "[Coach] 样板三角形顶点数无效")
+    local scratch = Node()
+    scratch.enabled = false
+    local model = Model()
+    local ok, message = pcall(function()
+        assert(b:CommitTo(scratch, material) == count, "[Coach] 样板提交顶点不完整")
+        local geometry = assert(scratch:GetComponent("CustomGeometry"))
+        assert(geometry:FillModel(model), "[Coach] CustomGeometry导出Model失败")
+        assert(model.numGeometries == 1 and model:GetGeometry(0, 0).vertexCount == count,
+            "[Coach] 共享Model几何不完整")
+        assert(model:SetGeometryCenter(0, model.boundingBox.center), "[Coach] 共享Model中心设置失败")
+    end)
+    -- FillModel输出由Model拥有，不与临时CustomGeometry生命周期绑定。
+    scratch:RemoveAllComponents()
+    scratch:Dispose()
+    if not ok then model:Dispose(); error(tostring(message)) end
+    return {name=name, model=model, material=material, shadows=shadows ~= false, vertices=count}
 end
 
 ---@param b CoachBatches
----@param parent Node
 ---@param prefix string
----@return integer
-local function SubmitBatches(b, parent, prefix)
+---@return CoachSharedMesh[]
+local function BakeBatches(b, prefix)
     local m = GetMaterials()
-    return Submit(b.white, parent, prefix .. "PaintWhite", m.white)
-        + Submit(b.blue, parent, prefix .. "PaintBlue", m.blue)
-        + Submit(b.roof, parent, prefix .. "RoofSteel", m.roof)
-        + Submit(b.dark, parent, prefix .. "Underframe", m.dark)
-        + Submit(b.steel, parent, prefix .. "MetalDetails", m.steel)
-        + Submit(b.rubber, parent, prefix .. "Rubber", m.rubber)
-        + Submit(b.glass, parent, prefix .. "Glazing", m.glass, false)
-        + Submit(b.detail, parent, prefix .. "Engineering", m.detail, false)
+    local result = {} ---@type CoachSharedMesh[]
+    local function append(builder, suffix, material, shadows)
+        if builder:Count() > 0 then
+            result[#result + 1] = BakeMesh(builder, prefix .. suffix, material, shadows)
+        end
+    end
+    append(b.white, "PaintWhite", m.white, true)
+    append(b.blue, "PaintBlue", m.blue, true)
+    append(b.stripe, "LiveryStripe", m.stripe, true)
+    append(b.door, "DoorLeaf", m.door, true)
+    append(b.accent, "LiveryAccent", m.accent, true)
+    append(b.roof, "RoofSteel", m.roof, true)
+    append(b.dark, "Underframe", m.dark, true)
+    append(b.steel, "MetalDetails", m.steel, true)
+    append(b.rubber, "Rubber", m.rubber, true)
+    append(b.glass, "Glazing", m.glass, false)
+    append(b.detail, "Engineering", m.detail, false)
+    return result
+end
+
+---@param node Node
+---@param mesh CoachSharedMesh
+local function AttachMesh(node, mesh)
+    local drawable = node:CreateComponent("StaticModel")
+    drawable.model = mesh.model
+    drawable:SetMaterial(mesh.material)
+    drawable.castShadows = mesh.shadows
+    drawable.viewMask = 1
+end
+
+---@param meshes CoachSharedMesh[]
+---@param parent Node
+---@return integer
+local function AttachBatches(meshes, parent)
+    local count = 0
+    for _, mesh in ipairs(meshes) do
+        AttachMesh(parent:CreateChild(mesh.name), mesh)
+        count = count + mesh.vertices
+    end
+    return count
 end
 
 ---@param y number
@@ -293,7 +376,10 @@ local function BuildShell(b, openings)
         end
         -- 细腰线、雨槽及焊接分缝，不使用包围整车的色块盒子。
         Box(b.steel, side * 1.553, 2.105, 0, .018, .024, 23.96)
-        Box(b.blue, side * 1.550, 3.455, 0, .022, .040, 23.94)
+        -- 车队特征条：上窄下宽双带，属于该机车专属客车队，颜色来自涂装表。
+        Box(b.stripe, side * 1.550, 3.455, 0, .022, .040, 23.94)
+        Box(b.stripe, side * 1.551, 2.230, 0, .020, .055, 23.94)
+        Box(b.accent, side * 1.552, 2.155, 0, .016, .022, 23.94)
         for _, z in ipairs({-9.45, -5.19, -1.73, 1.73, 5.19, 9.45}) do
             Box(b.dark, side * 1.552, 1.73, z, .006, .36, .008)
         end
@@ -370,11 +456,14 @@ local function BuildWindowsAndDoors(b, openings)
                 Box(b.steel,side*1.575,y0-.025,z,.064,.022,width+.025)
             else
                 -- 实心门扇单独留上部窗洞，不在门玻璃后面铺白板。
-                Box(b.blue,side*1.509,1.84,z,.033,.64,width-.065)
-                Box(b.white,side*1.509,2.35,z,.033,.38,width-.065)
-                Box(b.white,side*1.509,3.215,z,.033,.13,width-.065)
-                Box(b.white,side*1.509,2.82,z0+.10,.033,.65,.13)
-                Box(b.white,side*1.509,2.82,z1-.10,.033,.65,.13)
+                Box(b.door,side*1.509,1.84,z,.033,.64,width-.065)
+                Box(b.door,side*1.509,2.35,z,.033,.38,width-.065)
+                Box(b.door,side*1.509,3.215,z,.033,.13,width-.065)
+                Box(b.door,side*1.509,2.82,z0+.10,.033,.65,.13)
+                Box(b.door,side*1.509,2.82,z1-.10,.033,.65,.13)
+                -- 门缝两侧点缀色，让不同客车队的车门在远处也能区分。
+                Box(b.accent,side*1.509,1.84,z0+.035,.036,.64,.03)
+                Box(b.accent,side*1.509,1.84,z1-.035,.036,.64,.03)
                 SideFace(b.glass,side,side*1.516,z0+.18,z1-.18,2.55,3.12)
                 Box(b.steel,side*1.538,2.54,z,.022,.021,width-.30)
                 Box(b.steel,side*1.538,3.13,z,.022,.021,width-.30)
@@ -413,6 +502,10 @@ local function BuildEnds(b, index)
         Box(b.white,0,3.365,z,1.12,.21,.09)
         Box(b.blue,-1.055,1.75,sign*12.006,.99,.48,.012)
         Box(b.blue,1.055,1.75,sign*12.006,.99,.48,.012)
+        -- 端部车队色带：连接处一眼分辨当前牵引车队。
+        Box(b.stripe,0,3.365,sign*12.012,1.16,.13,.010)
+        Box(b.accent,-1.32,2.30,sign*12.010,.10,1.30,.010)
+        Box(b.accent,1.32,2.30,sign*12.010,.10,1.30,.010)
         -- 内凹的端部门扇以及独立小窗。
         Box(b.dark,0,1.98,sign*11.91,1.065,.92,.035)
         Box(b.dark,-.48,2.82,sign*11.91,.10,.76,.035)
@@ -498,7 +591,7 @@ local function Spring(b, x, y, z)
     for i = 1, steps do
         local t0,t1 = (i-1)*2*math.pi*5/steps,i*2*math.pi*5/steps
         Rod(b,Vector3(x+.066*math.cos(t0),y-.105+(i-1)*.21/steps,z+.066*math.sin(t0)),
-            Vector3(x+.066*math.cos(t1),y-.105+i*.21/steps,z+.066*math.sin(t1)),.014,5)
+            Vector3(x+.066*math.cos(t1),y-.105+i*.21/steps,z+.066*math.sin(t1)),.014,5,i == 1 or i == steps)
     end
 end
 
@@ -509,6 +602,10 @@ end
 local function BuildBogie(parent, z, number)
     local pivot = parent:CreateChild("CoachBogie" .. number)
     pivot.position = Vector3(0,0,z)
+    if #bogieCache > 0 then
+        AttachBatches(bogieCache, pivot)
+        return {node=pivot,z=z}
+    end
     local b = NewBatches()
     -- 开放式H框架。轮心x.7175，侧框x1.015，不用板块遮住轮子。
     for _, side in ipairs({-1,1}) do
@@ -538,7 +635,8 @@ local function BuildBogie(parent, z, number)
         Rod(b.steel,Vector3(-1.00,.80,axleZ),Vector3(1.00,.80,axleZ),.065,12)
         Rod(b.dark,Vector3(-.90,.89,axleZ+.46),Vector3(.90,.89,axleZ+.46),.025,8)
     end
-    SubmitBatches(b,pivot,"Bogie")
+    bogieCache = BakeBatches(b, "Bogie")
+    AttachBatches(bogieCache, pivot)
     return {node=pivot,z=z}
 end
 
@@ -561,8 +659,14 @@ local function BuildWheel(parent, side, axleZ)
     wheel.position = Vector3(side*.7175,.80,axleZ)
     -- 网格已经烘焙成X轴轮轴，保留单位四元数作为自转基础朝向。
     wheel.rotation = Quaternion()
+    local shared = wheelCache[side]
+    if shared then
+        AttachMesh(wheel, shared)
+        return wheel
+    end
     local b = MeshUtils.NewBuilder()
-    local segments = 28
+    -- 12边仍采到上下踏面极值、完整13点轮缘剖面；仅降低圆周细分。
+    local segments = 12
     for j = 1, #WHEEL_PROFILE-1 do
         local p0 = assert(WHEEL_PROFILE[j])
         local p1 = assert(WHEEL_PROFILE[j + 1])
@@ -593,12 +697,29 @@ local function BuildWheel(parent, side, axleZ)
         local y,z = .115*math.cos(angle),.115*math.sin(angle)
         Rod(b,Vector3(side*.124,y,z),Vector3(side*.144,y,z),.019,6)
     end
-    b:CommitTo(wheel,GetMaterials().steel)
-    local geometry = wheel:GetComponent("CustomGeometry")
-    geometry.castShadows = true
-    geometry.viewMask = 1
+    local mesh = BakeMesh(b, side < 0 and "CoachWheelLeft" or "CoachWheelRight", GetMaterials().steel, true)
+    wheelCache[side] = mesh
+    AttachMesh(wheel, mesh)
     return wheel
 end
+
+--- 切换客车队涂装。几何缓冲与转向架/车轮共享缓存不随车队重建；
+--- 只有车体材质按涂装重新烘焙，因此换车队不增加几何或节点数量。
+---@param locomotiveId string|nil 机车内部 ID
+---@return string 实际生效的涂装名
+function Coach.SelectLivery(locomotiveId)
+    local livery = CoachLiveries.Get(locomotiveId)
+    if livery.id ~= livery_.id then
+        livery_ = livery
+        bodyCache = {}
+    end
+    return livery.name
+end
+
+---@return string
+function Coach.GetLiveryName() return livery_.name end
+---@return string
+function Coach.GetLiveryId() return livery_.id end
 
 --- 在已有车辆父节点下构建，不改变父节点的位置或旋转。
 --- forwardSign由Train决定动画方向；模型始终朝局部+Z，负值不会翻转车体。
@@ -609,13 +730,23 @@ end
 ---@param forwardSign? number 动画方向策略，默认为+1。
 ---@return CoachBuildResult
 function Coach.Build(parent, index, forwardSign)
-    local b = NewBatches()
-    local openings = Openings()
-    BuildShell(b,openings)
-    BuildWindowsAndDoors(b,openings)
-    BuildEnds(b,index)
-    BuildEquipment(b)
-    local staticVertices = SubmitBatches(b,parent,"Coach")
+    parent:SetVar("DisplayName", Variant(FictionalWorld.coachName))
+    parent:SetVar("LiveryName", Variant(livery_.name))
+    parent:SetVar("FleetNumber", Variant(string.format("%s-%02d", livery_.code, index)))
+    -- 唯一几何差异是首节+Z端高车钩；不是按每个车号复制整个车体缓冲。
+    local key = index == 1 and "first" or "standard"
+    local meshes = bodyCache[key]
+    if not meshes then
+        local b = NewBatches()
+        local openings = Openings()
+        BuildShell(b,openings)
+        BuildWindowsAndDoors(b,openings)
+        BuildEnds(b,index)
+        BuildEquipment(b)
+        meshes = BakeBatches(b, "Coach")
+        bodyCache[key] = meshes
+    end
+    local staticVertices = AttachBatches(meshes, parent)
     ---@type CoachBogie[]
     local bogies = {BuildBogie(parent,-Coach.BogieOffset,1),BuildBogie(parent,Coach.BogieOffset,2)}
     ---@type Node[]
@@ -627,8 +758,12 @@ function Coach.Build(parent, index, forwardSign)
             end
         end
     end
-    print(string.format("[Coach] 第%d节：车体%d顶点，2转向架，8个X轴车轮，方向%+.0f",
-        index,staticVertices,forwardSign or 1))
+    local bogieVertices = 0
+    for _, mesh in ipairs(bogieCache) do bogieVertices = bogieVertices + mesh.vertices end
+    local leftWheel, rightWheel = assert(wheelCache[-1]), assert(wheelCache[1])
+    local totalVertices = staticVertices + 2 * bogieVertices + 4 * (leftWheel.vertices + rightWheel.vertices)
+    print(string.format("[Coach] 第%d节：共享车体%d/整车%d顶点，0CG/%d StaticModel，2转向架/8独立X轴轮，方向%+.0f",
+        index,staticVertices,totalVertices,#meshes + 2 * #bogieCache + 8,forwardSign or 1))
     return {wheels=wheels,bogies=bogies,wheelRadius=Coach.WheelRadius}
 end
 

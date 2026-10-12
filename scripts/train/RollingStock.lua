@@ -4,6 +4,7 @@
 -- ============================================================================
 local GameConfig = require "config.GameConfig"
 local Catalog = require "config.TrainCatalog"
+local BodyShellRepairs = require "train.BodyShellRepairs"
 local RollingStock = {}
 
 ---@class RollingStockCalibration
@@ -42,8 +43,25 @@ local RollingStock = {}
 ---@field contactRight number[]
 ---@field calibrationInputs {forwardSign:number,underframeTop:number,transitionTop:number,roofSource:number?,roofHeight:number?,contactLeft:RollingStockContactBox,contactRight:RollingStockContactBox}?
 ---@field roundTripVerified boolean
+---@field sourceChecksum number
+---@field diffusePath string
+---@field appearanceTextureAlignment {sideReports:{side:number,after_mean_y:number,head_target_y:number}[]}|nil
+
+---@class RollingStockAppearanceReport
+---@field id string
+---@field accepted boolean
+---@field status string
+---@field message string
+---@field front RollingStockEndFace|nil
+---@field rear RollingStockEndFace|nil
 
 local calibrated_ = {} ---@type table<string, RollingStockCalibration>
+local retainedProfiles_ = {} ---@type table<string, boolean>
+---@param ids string[]
+function RollingStock.RetainProfiles(ids)
+    retainedProfiles_ = {}
+    for _, id in ipairs(ids) do retainedProfiles_[id] = true end
+end
 ---@type table<string, string>
 local errors_ = {}
 ---@type table<string, boolean>
@@ -428,6 +446,138 @@ function RollingStock.ReadMetadata(id)
     return metadata
 end
 
+--- 资源实际类型检查，不按文件扩展名或Asset字段名字推断。
+---@param resource Resource
+---@param expected string
+---@param path string
+---@return Resource
+function RollingStock.VerifyResourceType(resource, expected, path)
+    assert(resource and resource:GetTypeName() == expected,
+        "资源实际类型错误：" .. path .. "，需要" .. expected)
+    return resource
+end
+
+---@param face RollingStockEndFace|nil
+---@param width number
+---@return boolean, string
+local function validFlatFace(face, width)
+    if not face or not face.measured then return false, "缺少离线实测端面" end
+    if face.kind ~= "flat" then return false, "连接端是尖鼻而非平端" end
+    if face.samples < 8 or face.width < width * .72 or face.height < 1.8 then
+        return false, "端面样本/宽高不足，不能用风挡掩盖窄鼻"
+    end
+    local aspect = face.width / face.height
+    if aspect < .80 or aspect > 1.60 then return false, "双平端宽高比不合格" end
+    return true, "端面实测有效"
+end
+
+--- 正常入口只读profile和小JSON，不扫描VB；appearance失败不破坏已能加载的资产。
+---@param id string
+---@return RollingStockAppearanceReport
+function RollingStock.GetAppearanceReport(id)
+    local profile = Catalog.Profiles[id]
+    if not profile or not profile.expectedShape then
+        return {id=id,accepted=true,status="not_applicable",message="非EMU端面验收对象"}
+    end
+    local survey = profile.endSurvey
+    local report = {id=id,accepted=true,status="accepted",message="实测外观通过",
+        front=survey and survey.front, rear=survey and survey.rear} --[[@as RollingStockAppearanceReport]]
+    local ok, metadata = pcall(RollingStock.ReadMetadata, id)
+    if not ok or not survey or survey.sourceChecksum ~= metadata.sourceChecksum then
+        report.accepted, report.status, report.message = false, "pending", "端面记录缺失或与当前MDL来源不匹配，须离线重测"
+        return report
+    end
+    local rearOK, rearMessage = validFlatFace(survey.rear, profile.width)
+    local frontOK, frontMessage = true, ""
+    if profile.expectedShape == "double_flat" then
+        frontOK, frontMessage = validFlatFace(survey.front, profile.width)
+        if frontOK and rearOK and survey.front and survey.rear then
+            local f, r = survey.front, survey.rear
+            frontOK = math.abs(f.width / f.height - r.width / r.height) <= .15
+                and math.abs(f.height - r.height) <= .15 and math.abs(f.center.y - r.center.y) <= .15
+            frontMessage = "双平端宽高比或端门高度不对称"
+        end
+    end
+    if profile.appearanceStatus ~= "accepted" or not rearOK or not frontOK then
+        report.accepted, report.status = false, profile.appearanceStatus or "pending"
+        report.message = profile.appearanceIssue or (not rearOK and rearMessage or frontMessage)
+    end
+    return report
+end
+
+--- 返回车辆父节点坐标的合法平端；尾复用头旋转时前后端/横向坐标同时转换。
+---@param id string
+---@param side string front|rear
+---@param reverse? boolean
+---@return RollingStockEndFace|nil, string
+function RollingStock.GetConnectionEnd(id, side, reverse)
+    local profile = Catalog.Profiles[id]
+    if not profile then return nil, "未知profile" end
+    local survey = profile.endSurvey
+    if not survey then return nil, "未实测端面，禁止BBox猜锚点" end
+    local metadataOK, metadata = pcall(RollingStock.ReadMetadata, id)
+    if not metadataOK or survey.sourceChecksum ~= metadata.sourceChecksum then
+        return nil, "端面实测记录与当前资源不匹配"
+    end
+    local modelSide = reverse and (side == "front" and "rear" or "front") or side
+    local face = survey.rear
+    if modelSide == "front" then face = survey.front end
+    local ok, message = validFlatFace(face, profile.width)
+    if not ok or not face then return nil, message end
+    local sign = reverse and -1 or 1
+    return {kind=face.kind, center=Vector3(face.center.x*sign,face.center.y,face.center.z*sign),
+        width=face.width,height=face.height,outward=face.outward*sign,
+        samples=face.samples,slabDepth=face.slabDepth,measured=true}, message
+end
+
+--- 显式离线实测入口：只此函数读LOD0顶点，Start/main/Prepare均不调用。
+-- 相同算法可测新资产；输出数值在用户确认+真实MDL交付后填入profile.endSurvey。
+---@param id string
+---@return {front:RollingStockEndFace,rear:RollingStockEndFace}
+function RollingStock.MeasureEndsOffline(id)
+    local profile = assert(Catalog.Profiles[id])
+    local survey = assert(profile.endSurvey, "先定义此资产的端面采样ROI")
+    local model = RollingStock.LoadBakedModel(id)
+    local positions, normals = readLodZero(model)
+    local function measure(sign)
+        local bins = {} ---@type table<number, Vector3[]>
+        for i, p in ipairs(positions) do
+            if p.z*sign > survey.terminalZ and p.y > survey.axialYMin and p.y < survey.axialYMax
+                and math.abs(p.x) < survey.axialXMax and normals[i].z*sign > .90 then
+                local bucket = math.floor(p.z/.10+.5)
+                bins[bucket] = bins[bucket] or {}
+                bins[bucket][#bins[bucket]+1] = p
+            end
+        end
+        -- 中央端门/既有风挡可能伸出车体；按全宽/全高截面筛选轴向峰，不能挑窄门峰当车体端面。
+        local samples = {} ---@type Vector3[]
+        local plane = 0.0
+        local slab = BoundingBox()
+        for _, points in pairs(bins) do
+            if #points >= 8 then
+                local zs = {}
+                for _, p in ipairs(points) do zs[#zs+1] = p.z end
+                table.sort(zs)
+                local mid = math.floor((#zs+1)*.5)
+                local candidate = #zs%2 == 0 and (zs[mid]+zs[mid+1])*.5 or zs[mid]
+                local section = BoundingBox()
+                for _, p in ipairs(positions) do
+                    if math.abs(p.z-candidate) <= .18 and p.y >= survey.bodyYMin and p.y <= survey.bodyYMax then section:Merge(p) end
+                end
+                if section.size.x >= profile.width*.72 and section.size.y >= 1.8 and #points > #samples then
+                    samples,plane,slab = points,candidate,section
+                end
+            end
+        end
+        assert(#samples >= 8, "全宽平端轴向采样不足（可能是尖鼻或窄门）：" .. id)
+        local known = sign == 1 and survey.front or survey.rear
+        return {center=Vector3(slab.center.x,slab.center.y,plane),width=slab.size.x,height=slab.size.y,
+            outward=sign,slabDepth=.18,samples=#samples,measured=true,kind=known and known.kind or "unreviewed"}
+            --[[@as RollingStockEndFace]]
+    end
+    return {front=measure(1),rear=measure(-1)}
+end
+
 ---@param id string
 ---@return boolean
 function RollingStock.IsAvailable(id)
@@ -469,10 +619,21 @@ function RollingStock.LoadBakedModel(id)
     local asset = assert(Catalog.Assets[id])
     assert(cache:Exists(asset.modelPath), "缺少已烘焙MDL：" .. asset.modelPath .. "，禁止运行时重新校准")
     local model = assert(cache:GetResource("Model", asset.modelPath), "烘焙MDL载入失败")
+    RollingStock.VerifyResourceType(model, "Model", asset.modelPath)
     assert(model.numGeometries == metadata.geometryCount and model.numGeometries > 0, "烘焙模型未完整加载")
     assert(model:GetNumGeometryLodLevels(0) == metadata.lodCount, "烘焙LOD不完整")
     assert((model.boundingBox.min - fromVector(metadata.boundsMin)):Length() < .002
         and (model.boundingBox.max - fromVector(metadata.boundsMax)):Length() < .002, "烘焙包络与元数据不符")
+    -- Camera.GetLodDistance 的实际提交实测确认按包围盒平均边长归一化。
+    -- 用米制可见距离转换阈值，不再把50/125/260误作归一化距离；不改顶点或近景偏置。
+    local size=model.boundingBox.size
+    local scale=math.max(.001,(size.x+size.y+size.z)/3)
+    local distances={0,85,220,550}
+    for g=0,model.numGeometries-1 do
+        for lod=0,model:GetNumGeometryLodLevels(g)-1 do
+            model:GetGeometry(g,lod).lodDistance=(distances[lod+1] or 550)/scale
+        end
+    end
     return model, metadata
 end
 
@@ -492,6 +653,8 @@ function RollingStock.Prepare(id)
         -- Texture2D会自动DWP，不能先用Exists拒绝尚未下载的媒体。
         local diffuse = assert(cache:GetResource("Texture2D", asset.diffusePath), "涂装资源无法加载")
         local normal = assert(cache:GetResource("Texture2D", asset.normalPath), "法线资源无法加载")
+        RollingStock.VerifyResourceType(diffuse, "Texture2D", asset.diffusePath)
+        RollingStock.VerifyResourceType(normal, "Texture2D", asset.normalPath)
         diffuse:SetSRGB(true)
         normal:SetSRGB(false)
         mat:SetTexture(TU_DIFFUSE, diffuse)
@@ -512,6 +675,11 @@ function RollingStock.Prepare(id)
     calibrated_[id] = result
     errors_[id] = nil
     print("[RollingStock] 按需加载离线MDL " .. id .. "，无运行时顶点处理")
+    local appearance = RollingStock.GetAppearanceReport(id)
+    if not appearance.accepted then
+        print("[RollingStock] 外观验收未通过 " .. id .. "：" .. appearance.message
+            .. "；资产保留可预览，非法连接端不生成风挡。")
+    end
     return true, "离线资源已加载"
 end
 
@@ -520,7 +688,7 @@ end
 ---@param middle? string
 function RollingStock.ReleaseExcept(head, middle)
     for id in pairs(calibrated_) do
-        if id ~= head and id ~= middle then
+        if id ~= head and id ~= middle and not retainedProfiles_[id] then
             calibrated_[id] = nil
             local asset = assert(Catalog.Assets[id])
             cache:ReleaseResource("Model", asset.modelPath)
@@ -550,6 +718,8 @@ function RollingStock.Build(parent, id, reverse)
     drawable.model = data.model
     for g = 0, data.model.numGeometries - 1 do drawable:SetMaterial(g, data.materials[g + 1]) end
     drawable.castShadows, drawable.viewMask = true, 1
+    -- Separate shared patch stays in this car subtree; source MDL and D/N unchanged.
+    BodyShellRepairs.Attach(node, id, assert(data.materials[1]))
     return node, drawable
 end
 

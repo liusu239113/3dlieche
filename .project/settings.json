@@ -39,8 +39,8 @@
       "match_info": {
         "desc_name": "free_match",
         "immediately_start": false,
-        "match_timeout": 30,
-        "player_number": 2
+        "match_timeout": 0,
+        "player_number": 1
       },
       "persistent_world": {
         "enabled": false

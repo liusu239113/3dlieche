@@ -5,10 +5,17 @@ local GameConfig = require "config.GameConfig"
 local Skin = require "ui.CabStyle"
 local Cab = require "ui.CabInstruments"
 local TrainSelector = require "ui.TrainSelector"
+local CameraSelector = require "ui.CameraSelector"
+local HudPanels = require "ui.HudPanels"
+local Passenger = require "ui.HudPassenger"
 local C = Skin.Colors
+-- BrawlForge warning token 用于真实黄灯，非把驾驶台橙色提示当黄灯。
+local SIGNAL_YELLOW = { 255, 198, 26, 255 }
 local Hud = {}
 
 ---@class CabHudCallbacks
+---@field onMainMenu? fun()
+---@field onSettings? fun()
 ---@field onThrottleUp? fun()
 ---@field onThrottleDown? fun()
 ---@field onBrake? fun() 保留旧接口：按下一次追加一档制动
@@ -17,17 +24,31 @@ local Hud = {}
 ---@field onReleaseBrake? fun() Explicit brake pressure release / 缓解
 ---@field onHorn? fun()
 ---@field onPause? fun()
----@field onCamera? fun()
+---@field onCamera? fun() 保留原顺序循环，独立“下一视角”按钮调用
+---@field onSelectCamera? fun(id: string): boolean?, string? main 选择真实 Camera id；false 拒绝
 ---@field onReverse? fun()
----@field onSwitch? fun(dir: number) Retained; no fake turnout UI on a single-line loop
+---@field onSwitch? fun(dir: integer) -1 正线 / 1 站内到发线；main -> Game.SetSwitch -> RailNetwork
+---@field onDrivingMode? fun() main 切换休闲/模拟；未接入禁用
+---@field onService? fun() main 选择下一真实运营任务；未接入禁用
+---@field onRenderQuality? fun() main 切换流畅/细致；HUD 不修改 renderer
 ---@field onSelectTrain? fun(id: string): boolean, string? Main owns authoritative selection
 ---@field onOpenTrainSelector? fun(open: boolean) Main owns pause/restore and gameplay input gating
+---@field onRestart? fun()
+---@field onSoundVolume? fun(value:number)
+---@field onSoundToggle? fun(enabled: boolean) 可选：请求音频开关，main 用 SetSoundEnabled 回传实际状态
 ---@type CabHudCallbacks
 local callbacks_ = {}
 
 ---@class CabHudRefs
+---@field gameOver? Panel
+---@field gameOverReason? Label
 ---@field root? Panel
----@field info? CabPanel
+---@field info? Panel
+---@field routeToggle? Button
+---@field routeDetails? ScrollView
+---@field passenger? CabPassengerStrip
+---@field stationRow? Panel
+---@field statusRow? Panel
 ---@field actions? Panel
 ---@field station? Label
 ---@field distance? Label
@@ -51,9 +72,29 @@ local callbacks_ = {}
 ---@field bannerSub? Label
 ---@field toast? CabPanel
 ---@field toastText? Label
----@field trainBar? CabPanel
+---@field trainBar? Panel
 ---@field trainName? Label
 ---@field trainSelector? CabTrainSelector
+---@field cameraSelector? CabCameraSelector
+---@field cameraKey? Button
+---@field signalRed? Panel
+---@field signalYellow? Panel
+---@field signalGreen? Panel
+---@field signalText? Label
+---@field track? Label
+---@field switchText? Label
+---@field objective? Label
+---@field cameraName? Label
+---@field railwayControls? Panel
+---@field operationsToggle? Button
+---@field operationsDetails? ScrollView
+---@field soundToggle? Button
+---@field switchMainline? Button
+---@field switchSiding? Button
+---@field drivingMode? Button
+---@field nextService? Button
+---@field renderQuality? Button
+---@field operationModeRow? Panel
 ---@type CabHudRefs
 local refs_ = {}
 
@@ -70,13 +111,33 @@ local state_ = {
     station = GameConfig.Stations[1] and GameConfig.Stations[1].name or "下一站",
     distance = "计算距离",
     clock = "00:00",
+    clockSecond = -1,
     xp = "0",
     switch = 0.0,
     mapVisible = false,
     toastTime = 0.0,
     selectedTrainId = "",
     selectedTrainName = "待同步车型",
+    selectedCameraId = "",
+    selectedCameraName = "待同步视角",
+    drivingMode = "待同步",
+    renderQuality = "流畅",
+    railwayReady = false,
+    aspect = "unknown",
+    signalText = "信号待同步",
+    track = "线路待同步",
+    switchText = "道岔待同步",
+    switchLocked = true,
+    objective = "运营任务待同步",
+    serviceName = "",
+    routeExpanded = false,
+    operationsExpanded = false,
+    passengerSynced = false,
+    passenger = Passenger.Snapshot(nil),
+    soundEnabled = true,
 }
+---@type CabCameraCatalogEntry[]
+local cameraCatalog_ = {}
 ---@type CabTrainCatalogEntry[]
 local trainCatalog_ = {}
 ---@type CabMapPoint[]
@@ -88,6 +149,9 @@ local mapTrain_ = { x = 0.0, z = 0.0 }
 local activeStation_ = nil
 local lastLayout_ = ""
 local lastStatus_ = ""
+local layoutTimer_ = 0.0
+local layoutViewportW_, layoutViewportH_, layoutScale_ = 0.0, 0.0, 0.0
+local statusDirty_ = true
 -- 使用专用暂停同步接口后，Toast 文案不再参与暂停状态管理。
 local explicitPause_ = false
 
@@ -100,13 +164,51 @@ local function Number(value, fallback)
     return n
 end
 
+---@param name string?
+---@param id string
+---@param fallback string
+---@return string
+local function DisplayName(name, id, fallback)
+    -- 目录 ID 是业务键，不是车型或镜头展示名；缺名时不泄露内部业务/资源键。
+    return type(name) == "string" and name ~= "" and name ~= id and name or fallback
+end
+
 ---@param label Label?
 ---@param text string
 local function Text(label, text)
     if label and label:GetText() ~= text then label:SetText(text) end
 end
 
+---@param button Button?
+---@param disabled boolean
+local function Disabled(button, disabled)
+    if button and button:IsDisabled() ~= disabled then button:SetDisabled(disabled) end
+end
+
+local function ObjectiveText()
+    if state_.serviceName == "" or string.find(state_.objective, state_.serviceName, 1, true) then
+        return state_.objective
+    end
+    return state_.serviceName .. " · " .. state_.objective
+end
+
+local function RefreshOperations()
+    local mainText = state_.switchLocked and "锁 · 正线" or "左 · 正线"
+    local sideText = state_.switchLocked and "锁 · 站内" or "右 · 站内"
+    if refs_.switchMainline and refs_.switchMainline.props.text ~= mainText then refs_.switchMainline:SetText(mainText) end
+    if refs_.switchSiding and refs_.switchSiding.props.text ~= sideText then refs_.switchSiding:SetText(sideText) end
+    Disabled(refs_.switchMainline, not callbacks_.onSwitch or not state_.railwayReady
+        or state_.switchLocked or state_.paused)
+    Disabled(refs_.switchSiding, not callbacks_.onSwitch or not state_.railwayReady
+        or state_.switchLocked or state_.paused)
+    Disabled(refs_.drivingMode, not callbacks_.onDrivingMode or state_.paused)
+    Disabled(refs_.nextService, not callbacks_.onService or state_.paused or math.abs(state_.speed) > 0.1)
+    Disabled(refs_.renderQuality, not callbacks_.onRenderQuality)
+end
+
 local function RefreshStatus()
+    if not statusDirty_ then return end
+    statusDirty_ = false
     local text, color = "待发", C.secondary
     if state_.paused then text, color = "暂停", C.orange
     elseif state_.dwelling then text, color = "站停", C.teal
@@ -142,17 +244,28 @@ local function BrakeRepeat()
     end
 end
 
+local function CanIncreaseThrottle()
+    if state_.paused then return false end
+    if state_.passengerSynced then
+        return state_.passenger.ready and not state_.passenger.doorsOpen
+    end
+    return not state_.dwelling
+end
+
 ---@param notch integer
 local function SelectThrottle(notch)
-    if state_.paused or state_.dwelling then return end
+    if state_.paused then return end
     local target = math.max(0, math.min(state_.maxNotch, notch))
+    if target > state_.notch and not CanIncreaseThrottle() then return end
     local callback = target > state_.notch and callbacks_.onThrottleUp or callbacks_.onThrottleDown
     if not callback then return end
-    -- 旧 API 只提供逐档回调，因此仅重放档位差；下一帧由
-    -- SetThrottle 的权威反馈校正手柄位置。
-    for _ = 1, math.abs(target - state_.notch) do callback() end
-    state_.notch = target
-    if refs_.throttle then refs_.throttle:SetNotch(target, state_.maxNotch) end
+    -- 逐档请求仍走旧 API；不把请求当权威结果，不写乐观 notch。
+    -- main/Game 拒绝（门开/未许可等）时手柄保持原真实档位，SetThrottle 才更新读数。
+    local steps = math.abs(target - state_.notch)
+    for _ = 1, steps do
+        if target > state_.notch and not CanIncreaseThrottle() then break end
+        callback()
+    end
 end
 
 ---@param props LabelProps
@@ -169,14 +282,20 @@ end
 local function LayoutHud()
     if not refs_.root then return end
     local vw, vh = UI.GetViewportSize()
+    local scale = UI.GetScale()
+    local resized = vw ~= layoutViewportW_ or vh ~= layoutViewportH_ or scale ~= layoutScale_
+    if not resized and layoutTimer_ > 0 then return end
+    layoutViewportW_, layoutViewportH_, layoutScale_ = vw, vh, scale
+    layoutTimer_ = 0.25 -- 胶囊/安全区签名最多 4Hz；视口或 DPR 改变则本帧立即重排。
     local safe = UI.GetSafeAreaInsets()
     local insetTop = safe.top
     if sdk and sdk.GetNativeExitMenuRect then
         local menu = sdk:GetNativeExitMenuRect()
         if menu then insetTop = math.max(insetTop, menu.bottom * graphics:GetHeight() / UI.GetScale()) end
     end
-    local signature = string.format("%.1f %.1f %.1f %.1f %.1f %.1f", vw, vh,
-        safe.left, insetTop, safe.right, safe.bottom)
+    local signature = string.format("%.1f %.1f %.1f %.1f %.1f %.1f %s %s %s", vw, vh,
+        safe.left, insetTop, safe.right, safe.bottom, tostring(state_.routeExpanded),
+        tostring(state_.operationsExpanded), tostring(state_.passengerSynced))
     if signature == lastLayout_ then return end
     lastLayout_ = signature
     local edge = 12
@@ -185,46 +304,100 @@ local function LayoutHud()
     local w, h = vw - left - right, vh - top - bottom
     local small = h < 490
     local narrow = w < 590
+    local large = w >= 900 and h >= 580
+    if not large and state_.routeExpanded and state_.operationsExpanded then
+        state_.routeExpanded = false -- 从大屏旋转/缩窗时仍只保留一个细节窗口。
+    end
+    local stacked = narrow and h >= 560
     local meterSize = small and 150 or 184
     local leverHeight = small and 134 or 150
     local deskWidth = 198
     local deskHeight = leverHeight + 58
+    local topStacked = w < 760 and h >= 340
+    local infoTop = topStacked and top + 52 or top
+    local routeBodyHeight = math.max(32, math.min(large and 86 or 66, h - 230))
+    local infoHeight = 76 + (state_.passengerSynced and 36 or 0)
+        + (state_.routeExpanded and routeBodyHeight + 2 or 0)
+    local infoWidth = math.min(large and 420 or 340,
+        topStacked and w or math.max(140, w - 326))
+    -- 极矮窄屏中上方信息可能落到右侧手柄的高度：缩窄信息而非覆盖制动。
+    if infoTop - top + infoHeight > h - deskHeight - 8 then
+        infoWidth = math.min(infoWidth, math.max(140, w - deskWidth - 12))
+    end
     if refs_.actions then refs_.actions:SetStyle({ top = top, right = right }) end
     if refs_.info then
-        refs_.info:SetStyle({ left = left, top = narrow and top + 52 or top,
-            width = math.min(520, narrow and w or math.max(220, w - 158)), height = 50 })
+        refs_.info:SetStyle({ left = left, top = infoTop, width = infoWidth, height = infoHeight })
     end
-    if refs_.extras then refs_.extras:SetVisible(w >= 740) end
+    if refs_.routeDetails then
+        refs_.routeDetails:SetHeight(routeBodyHeight)
+        refs_.routeDetails:SetVisible(state_.routeExpanded)
+    end
+    if refs_.routeToggle then refs_.routeToggle:SetText(state_.routeExpanded and "收起" or "详情") end
+    if refs_.passenger then refs_.passenger:SetVisible(state_.passengerSynced) end
+    if refs_.switchText then refs_.switchText:SetStyle({ maxWidth = 160 }) end
+    if refs_.extras then refs_.extras:SetVisible(large) end
     if refs_.meter then
         refs_.meter:SetStyle({ width = meterSize, height = meterSize,
-            right = narrow and right or right + deskWidth + 10,
-            bottom = narrow and bottom + deskHeight + 9 or bottom + 4 })
+            right = stacked and right or right + deskWidth + 10,
+            bottom = stacked and bottom + deskHeight + 9 or bottom + 4 })
     end
     if refs_.desk then refs_.desk:SetStyle({ right = right, bottom = bottom,
         width = deskWidth, height = deskHeight }) end
     if refs_.throttle then refs_.throttle:SetHeight(leverHeight) end
     if refs_.brake then refs_.brake:SetHeight(leverHeight) end
     if refs_.left then refs_.left:SetStyle({ left = left, bottom = bottom }) end
-    if refs_.hint then refs_.hint:SetVisible(not narrow and not small) end
+    local hintVisible = not narrow and not small
+    if refs_.hint then refs_.hint:SetVisible(hintVisible) end
+    -- 原64px仅覆盖52px底部按钮+12px留白；显示提示时补上其真实行高和8px gap。
+    local operationBottom = 116 + (hintVisible and refs_.hint and Number(refs_.hint.props.height, 0) + 8 or 0)
     if refs_.map then
-        refs_.map:SetStyle({ right = right, top = narrow and top + 110 or top + 60,
+        refs_.map:SetStyle({ right = right, top = infoTop + infoHeight + 8,
             width = small and 160 or 176, height = small and 92 or 104 })
     end
-    if refs_.banner then refs_.banner:SetStyle({ top = narrow and top + 110 or top + 62,
+    if refs_.banner then refs_.banner:SetStyle({ top = infoTop + infoHeight + 8,
         left = left, width = math.min(370, w - (narrow and 0 or 190)) }) end
-    if refs_.toast then refs_.toast:SetStyle({ top = narrow and top + 174 or top + 119,
-        left = left, width = math.min(370, w - (narrow and 0 or 190)) }) end
-    if refs_.trainBar then refs_.trainBar:SetStyle({ left = left, bottom = bottom + (small and 0 or 30) + 72,
-        width = math.min(290, math.max(0, w - deskWidth - (narrow and 16 or meterSize + 26))), height = 44 }) end
+    if refs_.toast then refs_.toast:SetStyle({ top = infoTop + infoHeight + (small and 2 or 8),
+        left = left, width = math.min(370, infoWidth),
+        minHeight = small and 16 or 34, maxHeight = small and 16 or 52,
+        paddingVertical = small and 2 or 6, overflow = "hidden" }) end
+    if refs_.toastText then refs_.toastText:SetStyle({ maxLines = small and 1 or 2,
+        whiteSpace = small and "nowrap" or "normal", fontSize = small and 9 or 10.5 }) end
+    local leftWidth = math.max(144, w - deskWidth - (stacked and 12 or meterSize + 26))
+    local operationWidth = math.min(large and 290 or 250, leftWidth)
+    local routeBottom = infoTop - top + infoHeight
+    -- 小屏最多露出约两行，画质/道岔/任务滚动访问；不能把全部按钮堆成大面板。
+    local operationBaseHeight = HudPanels.OperationsCollapsedHeight
+    local available = h - operationBottom - operationBaseHeight - routeBottom - 12
+    -- 至少52px=44px真实按钮+上下4px滚动内容边距，不能裁掉按钮后靠伪点击访问。
+    local operationBodyHeight = math.max(52, math.min(large and 196 or 92, available))
+    if refs_.railwayControls then refs_.railwayControls:SetStyle({ left = left, bottom = bottom + operationBottom,
+        width = operationWidth, height = operationBaseHeight + (state_.operationsExpanded and operationBodyHeight or 0) }) end
+    if refs_.operationsDetails then
+        refs_.operationsDetails:SetHeight(operationBodyHeight)
+        refs_.operationsDetails:SetVisible(state_.operationsExpanded)
+    end
+    if refs_.operationsToggle then refs_.operationsToggle:SetText(state_.operationsExpanded and "收起" or "展开") end
     if refs_.trainSelector then refs_.trainSelector:SetBounds(left, top, w, h) end
+    if refs_.cameraSelector then
+        local reserveTop = h >= 260 and 52 or 0
+        refs_.cameraSelector:SetBounds(left, top + reserveTop,
+            math.min(350, math.max(0, w - deskWidth - 12)), math.max(0, h - reserveTop))
+    end
     print(string.format("[Hud] 驾驶仪表 %.0fx%.0f base px, %s", vw, vh, narrow and "窄屏布局" or "横屏布局"))
 end
 
 ---@class CabHudRoot : Panel
 ---@overload fun(props?: PanelProps): CabHudRoot
 local HudRoot = UI.Panel:Extend("CabHudRoot")
+local renderedFrames_=0
+function HudRoot:Render(vg)
+    renderedFrames_=renderedFrames_+1
+    UI.Panel.Render(self,vg)
+end
+function Hud.GetRenderedFrames() return renderedFrames_ end
 ---@param dt number
 function HudRoot:Update(dt)
+    layoutTimer_ = math.max(0, layoutTimer_ - dt)
     LayoutHud()
     RefreshStatus()
     if state_.toastTime > 0 then
@@ -235,6 +408,7 @@ end
 
 ---@param cbs CabHudCallbacks?
 function Hud.Init(cbs)
+    if refs_.cameraSelector then refs_.cameraSelector:Close() end
     if refs_.trainSelector then refs_.trainSelector:Close() end
     callbacks_ = cbs or {}
     state_.limit = Number(GameConfig.Gameplay.SpeedLimitKmh, 80)
@@ -243,51 +417,91 @@ function Hud.Init(cbs)
     explicitPause_ = false
     state_.mapVisible = false
     state_.toastTime = 0
-    UI.Init({ theme = Skin.CreateTheme(), scale = UI.Scale.DEFAULT })
+    state_.routeExpanded, state_.operationsExpanded = false, false
+    -- 菜单、加载页与 HUD 共用同一套事件和渲染上下文；独立 HUD 测试仍可自行初始化。
+    if not UI.GetNVGContext() then
+        UI.Init({ theme = Skin.CreateTheme(), scale = UI.Scale.DEFAULT })
+    end
+    UI.SetEnabled(true)
+    renderedFrames_=0
     Hud.BuildRoot()
     print("[Hud] 金属驾驶仪表就绪，初始限速 " .. tostring(state_.limit) .. " km/h")
 end
 
 --- 保留重建 API；重建前安全释放按住的制动手柄。
 function Hud.BuildRoot()
+    if refs_.cameraSelector then refs_.cameraSelector:Close() end
     if refs_.trainSelector then refs_.trainSelector:Close() end
     if refs_.brake then refs_.brake:ReleaseHold() end
     refs_ = {}
     lastLayout_, lastStatus_ = "", ""
-    local station = Label { id = "stationName", text = state_.station, fontSize = 13.5,
+    layoutTimer_, statusDirty_ = 0, true
+    local station = Label { id = "stationName", text = state_.station, fontSize = 13.5, height = 20,
         fontWeight = "bold", minWidth = 64, flexGrow = 1, flexShrink = 1 }
     local distance = Label { id = "nextVal", text = state_.distance, fontColor = C.teal,
-        fontSize = 12, fontWeight = "bold", minWidth = 62, textAlign = "right" }
+        fontSize = 10.5, height = 20, fontWeight = "bold", minWidth = 0, textAlign = "left" }
     local status = Label { id = "runningState", text = "待发", fontSize = 9, fontColor = C.secondary }
     local statusLamp = UI.Panel { width = 4, height = 4, borderRadius = 2,
         backgroundColor = C.secondary, pointerEvents = "none" }
+    local cameraName = Label { id = "selectedCameraName", text = state_.selectedCameraName,
+        fontSize = 9, fontColor = C.secondary, maxWidth = 100, minWidth = 0, flexShrink = 1 }
     local clock = Label { text = state_.clock, fontSize = 9, fontColor = C.secondary }
     local xp = Label { text = "经验 " .. state_.xp, fontSize = 9, fontColor = C.muted }
     local extras = UI.Panel { flexDirection = "row", gap = 12, pointerEvents = "none", children = { clock, xp } }
-    local info = Cab.Panel {
-        id = "routeInfo", position = "absolute", width = 520, height = 50,
-        paddingHorizontal = 12, paddingVertical = 6, gap = 2, pointerEvents = "none",
-        children = {
-            UI.Panel { flexDirection = "row", alignItems = "center", gap = 12,
-                pointerEvents = "none", children = { station, distance } },
-            UI.Panel { flexDirection = "row", alignItems = "center", gap = 6,
+    local signalRed = UI.Panel { id = "signalRed", width = 7, height = 7,
+        borderRadius = 4, backgroundColor = state_.aspect == "red" and C.red or C.muted,
+        pointerEvents = "none" }
+    local signalYellow = UI.Panel { id = "signalYellow", width = 7, height = 7,
+        borderRadius = 4, backgroundColor = state_.aspect == "yellow" and SIGNAL_YELLOW or C.muted,
+        pointerEvents = "none" }
+    local signalGreen = UI.Panel { id = "signalGreen", width = 7, height = 7,
+        borderRadius = 4, backgroundColor = state_.aspect == "green" and C.teal or C.muted,
+        pointerEvents = "none" }
+    local signalText = Label { id = "railwaySignalText", text = state_.signalText,
+        fontSize = 9, minWidth = 0, flexGrow = 1, flexShrink = 1 }
+    local track = Label { id = "railwayTrack", text = state_.track, fontSize = 9,
+        minWidth = 0, flexGrow = 1, flexShrink = 1, fontColor = C.teal }
+    local switchText = Label { id = "railwaySwitchText",
+        text = (state_.switchLocked and "锁定 · " or "") .. state_.switchText, fontSize = 9,
+        minWidth = 0, flexShrink = 1, fontColor = state_.switchLocked and C.orange or C.secondary }
+    local objective = Label { id = "railwayObjective", text = ObjectiveText(), fontSize = 9,
+        fontColor = C.secondary, whiteSpace = "normal", maxLines = 2, lineHeight = 1.0,
+        height = 28, minWidth = 0, flexShrink = 1 }
+    local stationRow = UI.Panel { height = 40, flexGrow = 1, flexBasis = 0, minWidth = 0,
+        flexShrink = 1, gap = 0, pointerEvents = "none", children = {
+            UI.Panel { height = 20, flexDirection = "row", alignItems = "center", gap = 5,
                 pointerEvents = "none", children = {
-                    Label { text = "下一站", fontSize = 8, fontColor = C.muted },
-                    statusLamp, status, UI.Panel { flexGrow = 1 }, extras,
+                    Label { text = "下一站", fontSize = 8.5, fontColor = C.secondary }, station,
                 } },
-        },
-    }
-    local pause = Cab.Key { icon = "pause", text = "暂停", width = 44, height = 44,
+            distance,
+        } }
+    local statusRow = UI.Panel { height = 18, flexDirection = "row", alignItems = "center", gap = 5,
+        pointerEvents = "none", children = { signalRed, signalYellow, signalGreen, signalText } }
+    local routeParts = HudPanels.Route(stationRow, statusRow, {
+        UI.Panel { height = 20, flexDirection = "row", alignItems = "center", gap = 6,
+            pointerEvents = "none", children = { statusLamp, status, cameraName, extras } },
+        UI.Panel { height = 20, flexDirection = "row", alignItems = "center", gap = 6,
+            pointerEvents = "none", children = { track, switchText } }, objective,
+    }, function() Hud.SetRouteExpanded(not state_.routeExpanded) end)
+    local info = routeParts.panel
+    routeParts.passenger:SetStatus(state_.passenger)
+    local pause = Cab.Key { id = "pauseGame", icon = "pause", text = "暂停", width = 44, height = 44,
         onClick = function()
             if refs_.brake then refs_.brake:ReleaseHold() end
             if callbacks_.onPause then callbacks_.onPause() end
         end }
     local mapKey = Cab.Key { icon = "map", text = "线路", width = 44, height = 44,
         onClick = function() Hud.SetMinimapVisible(not state_.mapVisible) end }
+    local cameraKey = UI.Button { id = "openCameraSelector", text = "视角选择", width = 72, height = 44,
+        paddingHorizontal = 3, variant = "secondary", disabled = not callbacks_.onSelectCamera,
+        onClick = function() Hud.SetCameraSelectorOpen(not Hud.IsCameraSelectorOpen()) end }
     local actions = UI.Panel { position = "absolute", flexDirection = "row", gap = 6,
-        pointerEvents = "box-none", children = {
-            mapKey,
-            Cab.Key { icon = "camera", text = "视角", width = 44, height = 44,
+        paddingRight = 2, pointerEvents = "box-none", children = {
+            mapKey, cameraKey,
+            UI.Button { id = "openTrainSelector", text = "换车", width = 56, height = 44,
+                variant = "secondary", onClick = function() Hud.SetTrainSelectorOpen(true) end },
+            UI.Button { id = "cycleCamera", text = "下一视角", width = 72, height = 44,
+                paddingHorizontal = 3, variant = "secondary", disabled = not callbacks_.onCamera,
                 onClick = function() if callbacks_.onCamera then callbacks_.onCamera() end end },
             pause,
         } }
@@ -305,7 +519,9 @@ function Hud.BuildRoot()
                     alignSelf = "stretch",
                     pointerEvents = "box-none", children = {
                         Cab.Key { id = "throttleUp", icon = "up", hint = "W", width = 40, height = 44,
-                            onClick = function() if callbacks_.onThrottleUp then callbacks_.onThrottleUp() end end },
+                            onClick = function()
+                                if callbacks_.onThrottleUp and CanIncreaseThrottle() then callbacks_.onThrottleUp() end
+                            end },
                         Cab.Key { id = "throttleDown", icon = "down", hint = "S", width = 40, height = 44,
                             onClick = function() if callbacks_.onThrottleDown then callbacks_.onThrottleDown() end end },
                     } },
@@ -351,13 +567,80 @@ function Hud.BuildRoot()
         children = { toastText } }
     local trainName = Label { id = "selectedTrainName", text = state_.selectedTrainName,
         fontSize = 10.5, fontWeight = "bold", minWidth = 0, flexGrow = 1, flexShrink = 1 }
-    local trainBar = Cab.Panel { id = "trainModelBar", position = "absolute", width = 290, height = 44,
-        flexDirection = "row", alignItems = "center", paddingLeft = 10, gap = 8,
+    local trainBar = UI.Panel { id = "trainModelBar", width = "100%", height = 44,
+        flexDirection = "row", alignItems = "center", paddingLeft = 6, gap = 4,
         pointerEvents = "box-none", children = {
             trainName,
-            UI.Button { id = "openTrainSelector", text = "车型", width = 64, height = 44,
-                variant = "secondary", onClick = function() Hud.SetTrainSelectorOpen(true) end },
         } }
+    local switchMainline = UI.Button { id = "switchMainline", text = "左 · 正线", height = 44, width = 0,
+        flexGrow = 1, flexBasis = 0, flexShrink = 1, minWidth = 44, paddingHorizontal = 3,
+        variant = "secondary", disabled = true, onClick = function()
+            if callbacks_.onSwitch and state_.railwayReady and not state_.switchLocked and not state_.paused then
+                callbacks_.onSwitch(-1)
+            end
+        end }
+    local switchSiding = UI.Button { id = "switchSiding", text = "右 · 站内", height = 44, width = 0,
+        flexGrow = 1, flexBasis = 0, flexShrink = 1, minWidth = 44, paddingHorizontal = 3,
+        variant = "secondary", disabled = true, onClick = function()
+            if callbacks_.onSwitch and state_.railwayReady and not state_.switchLocked and not state_.paused then
+                callbacks_.onSwitch(1)
+            end
+        end }
+    local drivingMode = UI.Button { id = "drivingMode", text = "驾驶 · " .. state_.drivingMode,
+        height = 44, width = 0, flexGrow = 1, flexBasis = 0, flexShrink = 1,
+        minWidth = 44, paddingHorizontal = 3, variant = "secondary",
+        disabled = not callbacks_.onDrivingMode, onClick = function()
+            if callbacks_.onDrivingMode and not state_.paused then callbacks_.onDrivingMode() end
+        end }
+    local nextService = UI.Button { id = "nextService", text = "下一任务", height = 44, width = 0,
+        flexGrow = 1, flexBasis = 0, flexShrink = 1, minWidth = 44, paddingHorizontal = 3,
+        variant = "secondary", disabled = not callbacks_.onService, onClick = function()
+            if callbacks_.onService and not state_.paused and math.abs(state_.speed) <= 0.1 then
+                callbacks_.onService()
+            end
+        end }
+    local renderQuality = UI.Button { id = "renderQuality", text = "画质 · " .. state_.renderQuality,
+        width = 0, height = 44, flexGrow = 1, flexBasis = 0, minWidth = 44, flexShrink = 1,
+        paddingHorizontal = 3, variant = "secondary", disabled = not callbacks_.onRenderQuality,
+        onClick = function() if callbacks_.onRenderQuality then callbacks_.onRenderQuality() end end }
+    local soundToggle = UI.Button { id = "toggleSound", text = state_.soundEnabled and "静音" or "开启声音",
+        width = 80, height = 44, paddingHorizontal = 3, variant = "secondary",
+        visible = callbacks_.onSoundToggle ~= nil,
+        onClick = function()
+            if callbacks_.onSoundToggle then callbacks_.onSoundToggle(not state_.soundEnabled) end
+        end }
+    left:AddChild(soundToggle) -- 常驻声音入口，不再藏在运营滚动区。
+    local volumeSlider=UI.Slider {id="soundVolume",min=0,max=1,value=.55,height=36,width="100%",
+        onChange=function(self,value) if callbacks_.onSoundVolume then callbacks_.onSoundVolume(value) end end}
+    local operationModeRow = UI.Panel { height = 44, flexDirection = "row", gap = 4,
+        minWidth = 0, pointerEvents = "box-none", children = { drivingMode, nextService } }
+    local operationParts = HudPanels.Operations({
+        UI.Panel { height = 44, flexDirection = "row", gap = 4, minWidth = 0,
+            pointerEvents = "box-none", children = { renderQuality } },
+        volumeSlider,
+        UI.Panel { height = 44, flexDirection = "row", gap = 4, minWidth = 0,
+            pointerEvents = "box-none", children = { switchMainline, switchSiding } },
+        operationModeRow,
+        UI.Panel { height=44,flexDirection="row",gap=4,pointerEvents="box-none",children={
+            UI.Button{id="returnMainMenu",text="主菜单",height=44,flexGrow=1,visible=callbacks_.onMainMenu~=nil,
+                onClick=function() if callbacks_.onMainMenu then callbacks_.onMainMenu() end end},
+            UI.Button{id="openSettings",text="设置",height=44,flexGrow=1,visible=callbacks_.onSettings~=nil,
+                onClick=function() if callbacks_.onSettings then callbacks_.onSettings() end end},
+        } },trainBar,
+    }, function() Hud.SetOperationsExpanded(not state_.operationsExpanded) end)
+    local railwayControls = operationParts.panel
+    local cameraSelector = CameraSelector { id = "cameraSelector" }
+    cameraSelector:SetCallbacks({
+        onSelect = callbacks_.onSelectCamera,
+        onOpen = function(open)
+            -- 不通知 onOpenTrainSelector，不暂停，不释放制动：镜头菜单可以边驾驶边点。
+            if refs_.cameraKey then
+                refs_.cameraKey:SetText(open and "关闭视角" or "视角选择")
+            end
+        end,
+    })
+    cameraSelector:SetCatalog(cameraCatalog_)
+    cameraSelector:SetSelected(state_.selectedCameraId, state_.selectedCameraName)
     local selector = TrainSelector { id = "trainSelector" }
     selector:SetCallbacks({
         onSelect = callbacks_.onSelectTrain and function(id)
@@ -366,7 +649,7 @@ function Hud.BuildRoot()
                 -- main 可在回调内同步真实选择；未同步时从已注入的目录补齐名称。
                 if state_.selectedTrainId ~= id then
                     local entry = selector:FindTrain(id)
-                    Hud.SetSelectedTrain(id, entry and entry.name or id)
+                    Hud.SetSelectedTrain(id, entry and entry.name or "待同步车型")
                 end
                 Hud.Toast(message or "车型已切换", 2)
             end
@@ -379,103 +662,331 @@ function Hud.BuildRoot()
     selector:SetCatalog(trainCatalog_)
     selector:SetSelected(state_.selectedTrainId, state_.selectedTrainName)
     selector:SetOperatingState(state_.speed, state_.limit)
+    local gameOverReason=Label {text="",fontSize=12,whiteSpace="normal",maxLines=3,height=54}
+    local gameOverCard=UI.Panel {width="88%",maxWidth=620,padding=20,gap=12,
+        backgroundColor={20,25,33,240},borderRadius=12,
+        children={Label{text="脱轨事故 · 本局结束",fontSize=20,fontWeight="bold"},gameOverReason,
+            UI.Button{id="restartJourney",text="重开旅程",height=46,variant="primary",
+                onClick=function() if callbacks_.onRestart then callbacks_.onRestart() end end}}}
+    local gameOver=UI.Panel {id="gameOver",position="absolute",left=0,top=0,width="100%",height="100%",
+        justifyContent="center",alignItems="center",pointerEvents="auto",visible=false,
+        backgroundColor={0,0,0,55},children={gameOverCard}}
     local root = HudRoot { id = "hudRoot", width = "100%", height = "100%",
         pointerEvents = "box-none", children = { info, actions, meter, desk, left, map, banner, toast,
-            trainBar, selector } }
+            railwayControls, cameraSelector, selector, gameOver } }
     refs_ = {
-        root = root, info = info, actions = actions, station = station, distance = distance,
+        gameOver=gameOver,gameOverReason=gameOverReason,
+        root = root, info = info, stationRow = stationRow, statusRow = statusRow,
+        routeToggle = routeParts.toggle, routeDetails = routeParts.details, passenger = routeParts.passenger,
+        actions = actions, station = station, distance = distance,
         clock = clock, xp = xp, extras = extras, status = status, statusLamp = statusLamp,
         meter = meter, desk = desk, throttle = throttle, brake = brake, reverse = reverse,
         pause = pause, mapKey = mapKey, map = map, left = left, hint = hint,
         banner = banner, bannerTitle = bannerTitle, bannerSub = bannerSub, toast = toast, toastText = toastText,
         trainBar = trainBar, trainName = trainName, trainSelector = selector,
+        cameraSelector = cameraSelector, cameraKey = cameraKey,
+        signalRed = signalRed, signalYellow = signalYellow, signalGreen = signalGreen,
+        signalText = signalText, track = track, switchText = switchText, objective = objective,
+        cameraName = cameraName,
+        railwayControls = railwayControls, switchMainline = switchMainline, switchSiding = switchSiding,
+        drivingMode = drivingMode, nextService = nextService,
+        renderQuality = renderQuality, operationModeRow = operationModeRow,
+        operationsToggle = operationParts.toggle, operationsDetails = operationParts.body, soundToggle = soundToggle,
     }
     UI.SetRoot(root, true)
     -- 检查挂载与真实 ID，避免只有 refs 可用、按钮树却漏挂选择器。
     assert(root:FindById("trainSelector") == selector, "车型选择器未正确挂载到 HUD")
+    assert(root:FindById("cameraSelector") == cameraSelector, "镜头选择器未正确挂载到 HUD")
     LayoutHud()
     RefreshStatus()
+    RefreshOperations()
+end
+
+---@param expanded boolean
+function Hud.SetRouteExpanded(expanded)
+    local value = expanded == true
+    if state_.routeExpanded == value then return end
+    state_.routeExpanded = value
+    -- 小屏保持一个细节窗口，不把左右 HUD 一起展开成墙；大屏允许并列。
+    local w, h = UI.GetViewportSize()
+    if value and (w < 900 or h < 580) then state_.operationsExpanded = false end
+    layoutTimer_ = 0
+    LayoutHud()
+end
+
+---@param expanded boolean
+function Hud.SetOperationsExpanded(expanded)
+    local value = expanded == true
+    if state_.operationsExpanded == value then return end
+    state_.operationsExpanded = value
+    local w, h = UI.GetViewportSize()
+    if value and (w < 900 or h < 580) then state_.routeExpanded = false end
+    layoutTimer_ = 0
+    LayoutHud()
+end
+
+--- 只读客运快照：自动乘降与闭门由 Game 实现；不要求手动门按钮。
+---@param status CabPassengerStatus|table?
+function Hud.SetPassengerStatus(status)
+    if not status then return end
+    state_.passenger = Passenger.Snapshot(status)
+    if refs_.passenger then refs_.passenger:SetStatus(state_.passenger) end
+    if not state_.passengerSynced then
+        state_.passengerSynced = true
+        layoutTimer_ = 0
+        LayoutHud()
+    end
+end
+
+---@param enabled boolean
+function Hud.SetSoundEnabled(enabled)
+    state_.soundEnabled = enabled == true
+    if refs_.soundToggle then
+        refs_.soundToggle:SetText(state_.soundEnabled and "静音" or "开启声音")
+    end
 end
 
 -- 原有数据更新 API 保持有效；新增站名/方向更新无需反向引用
 -- 已经依赖 HUD 的 Game 或 Train 模块。
 ---@param text string
 function Hud.SetNextStation(text)
-    state_.distance = text or "计算距离"
+    local value = text or "计算距离"
+    if value == state_.distance then return end
+    state_.distance = value
     state_.dwelling = state_.distance == "停靠中" or state_.distance == "站停"
     Text(refs_.distance, state_.distance)
+    statusDirty_ = true
     RefreshStatus()
 end
 ---@param name string
 function Hud.SetStationName(name)
-    state_.station = name or "下一站"
+    local value = name or "下一站"
+    if value == state_.station then return end
+    state_.station = value
     Text(refs_.station, state_.station)
 end
 ---@param maximum number
 function Hud.SetSpeedRange(maximum)
-    state_.instrumentMax = math.max(40, math.ceil(Number(maximum, 400) / 20) * 20)
-    if refs_.meter then refs_.meter:SetRange(state_.instrumentMax) end
+    local value = math.max(40, math.ceil(Number(maximum, 400) / 20) * 20)
+    if value == state_.instrumentMax then return end
+    state_.instrumentMax = value
+    if refs_.meter then refs_.meter:SetRange(value) end
 end
 
 ---@param kmh number|string|nil
 function Hud.SetLimit(kmh)
     local value = Number(kmh, GameConfig.Gameplay.SpeedLimitKmh)
-    state_.limit = value >= 0 and value or GameConfig.Gameplay.SpeedLimitKmh
-    if refs_.meter then refs_.meter:SetReading(state_.speed, state_.limit) end
-    if refs_.trainSelector then refs_.trainSelector:SetOperatingState(state_.speed, state_.limit) end
+    local limit = value >= 0 and value or GameConfig.Gameplay.SpeedLimitKmh
+    if limit == state_.limit then return end
+    state_.limit = limit
+    if refs_.meter then refs_.meter:SetReading(state_.speed, limit) end
+    if refs_.trainSelector then refs_.trainSelector:SetOperatingState(state_.speed, limit) end
+    statusDirty_ = true
     RefreshStatus()
 end
 ---@param kmh number
 ---@param limit number|string|nil Optional, preserves old SetSpeed(kmh) call
 function Hud.SetSpeed(kmh, limit)
-    state_.speed = Number(kmh, 0)
-    if limit ~= nil then Hud.SetLimit(limit) end
-    if refs_.meter then refs_.meter:SetReading(state_.speed, state_.limit) end
-    if refs_.trainSelector then refs_.trainSelector:SetOperatingState(state_.speed, state_.limit) end
+    local speed = Number(kmh, 0)
+    local nextLimit = state_.limit
+    if limit ~= nil then
+        local value = Number(limit, GameConfig.Gameplay.SpeedLimitKmh)
+        nextLimit = value >= 0 and value or GameConfig.Gameplay.SpeedLimitKmh
+    end
+    if speed == state_.speed and nextLimit == state_.limit then return end
+    local stoppedChanged = (math.abs(speed) <= 0.1) ~= (math.abs(state_.speed) <= 0.1)
+    state_.speed, state_.limit = speed, nextLimit
+    -- 合并 speed/limit，只发送一次仪表 reading，避免每帧 SetLimit 再 SetReading。
+    if refs_.meter then refs_.meter:SetReading(speed, nextLimit) end
+    if refs_.trainSelector then refs_.trainSelector:SetOperatingState(speed, nextLimit) end
+    if stoppedChanged then RefreshOperations() end
+    statusDirty_ = true
     RefreshStatus()
 end
 ---@param seconds number
 function Hud.SetTime(seconds)
     local t = math.max(0, math.floor(Number(seconds, 0)))
-    state_.clock = string.format("%02d:%02d", math.floor(t / 60), t % 60)
-    Text(refs_.clock, state_.clock)
+    if t == state_.clockSecond then return end
+    state_.clockSecond = t
+    local value = string.format("%02d:%02d", math.floor(t / 60), t % 60)
+    if state_.clock == value then return end
+    state_.clock = value
+    Text(refs_.clock, value)
 end
+---@param xp number|string?
 function Hud.SetXp(xp)
-    state_.xp = tostring(xp or 0)
-    Text(refs_.xp, "经验 " .. state_.xp)
+    local value = tostring(xp or 0)
+    if state_.xp == value then return end
+    state_.xp = value
+    Text(refs_.xp, "经验 " .. value)
 end
 ---@param notch integer
 ---@param maxNotch integer
 function Hud.SetThrottle(notch, maxNotch)
-    state_.maxNotch = math.max(1, math.floor(Number(maxNotch, 8)))
-    state_.notch = math.max(0, math.min(state_.maxNotch, math.floor(Number(notch, 0))))
-    if refs_.throttle then refs_.throttle:SetNotch(state_.notch, state_.maxNotch) end
+    local maximum = math.max(1, math.floor(Number(maxNotch, 8)))
+    local value = math.max(0, math.min(maximum, math.floor(Number(notch, 0))))
+    if value == state_.notch and maximum == state_.maxNotch then return end
+    state_.maxNotch, state_.notch = maximum, value
+    if refs_.throttle then refs_.throttle:SetNotch(value, maximum) end
+    statusDirty_ = true
     RefreshStatus()
 end
 ---@param ratio number
 function Hud.SetBrake(ratio)
-    state_.brake = math.max(0, math.min(1, Number(ratio, 0)))
-    if refs_.brake then refs_.brake:SetRatio(state_.brake) end
+    local value = math.max(0, math.min(1, Number(ratio, 0)))
+    if value == state_.brake then return end
+    state_.brake = value
+    if refs_.brake then refs_.brake:SetRatio(value) end
+    statusDirty_ = true
     RefreshStatus()
 end
 ---@param reversing boolean
 function Hud.SetReversing(reversing)
-    state_.reversing = reversing == true
+    local value = reversing == true
+    if value == state_.reversing then return end
+    state_.reversing = value
     if refs_.reverse then
-        refs_.reverse:SetText(state_.reversing and "后退" or "前进")
-        refs_.reverse:SetActive(state_.reversing)
+        refs_.reverse:SetText(value and "后退" or "前进")
+        refs_.reverse:SetActive(value)
     end
 end
 ---@param pos number
 function Hud.SetSwitch(pos)
-    -- 仅保留兼容数据，单线环线没有真实道岔可操作。
-    state_.switch = math.max(-1, math.min(1, Number(pos, 0)))
+    -- 兼容旧接口，仅记录 main 回传的位置；轨道/锁定状态只由 SetRailwayStatus 提供。
+    local value = math.max(-1, math.min(1, Number(pos, 0)))
+    if value ~= state_.switch then state_.switch = value end
 end
+---@class CabRailwayStatus
+---@field aspect? string green / yellow / red；未知显示灰灯，不自行计算信号
+---@field text? string 信号说明
+---@field track? string 下行正线 / 上行正线 / 站内到发线
+---@field switchText? string 正线进路 / 侧线进路 / 道岔距离
+---@field locked? boolean 实际占用/安全锁定，由 RailNetwork 决定
+---@field objective? string 真实车次与运营任务
+
+--- 更新独立字段，重复状态不发 SetText/SetStyle，也不修改轨迹/信号/任务。
+---@param railway CabRailwayStatus?
+function Hud.SetRailwayStatus(railway)
+    if not railway then return end
+    local readyChanged = not state_.railwayReady
+    state_.railwayReady = true
+    if railway.aspect ~= nil and railway.aspect ~= state_.aspect then
+        local before = state_.aspect
+        state_.aspect = railway.aspect
+        if refs_.signalRed and ((before == "red") ~= (railway.aspect == "red")) then
+            refs_.signalRed:SetStyle({ backgroundColor = railway.aspect == "red" and C.red or C.muted })
+        end
+        if refs_.signalYellow and ((before == "yellow") ~= (railway.aspect == "yellow")) then
+            refs_.signalYellow:SetStyle({ backgroundColor = railway.aspect == "yellow" and SIGNAL_YELLOW or C.muted })
+        end
+        if refs_.signalGreen and ((before == "green") ~= (railway.aspect == "green")) then
+            refs_.signalGreen:SetStyle({ backgroundColor = railway.aspect == "green" and C.teal or C.muted })
+        end
+    end
+    if railway.text ~= nil and railway.text ~= state_.signalText then
+        state_.signalText = railway.text
+        Text(refs_.signalText, railway.text)
+    end
+    if railway.track ~= nil and railway.track ~= state_.track then
+        state_.track = railway.track
+        Text(refs_.track, railway.track)
+    end
+    local locked = railway.locked
+    local lockChanged = locked ~= nil and locked ~= state_.switchLocked
+    local switchChanged = railway.switchText ~= nil and railway.switchText ~= state_.switchText
+    if lockChanged then state_.switchLocked = locked == true end
+    if switchChanged then state_.switchText = railway.switchText or "" end
+    if lockChanged or switchChanged then
+        Text(refs_.switchText, (state_.switchLocked and "锁定 · " or "") .. state_.switchText)
+        if lockChanged and refs_.switchText then
+            refs_.switchText:SetFontColor(state_.switchLocked and C.orange or C.secondary)
+        end
+    end
+    if railway.objective ~= nil and railway.objective ~= state_.objective then
+        state_.objective = railway.objective
+        Text(refs_.objective, ObjectiveText())
+    end
+    if readyChanged or lockChanged then RefreshOperations() end
+end
+
+---@param name string
+function Hud.SetServiceName(name)
+    if name == state_.serviceName then return end
+    state_.serviceName = name
+    Text(refs_.objective, ObjectiveText())
+end
+
+---@param name string
+function Hud.SetDrivingMode(name)
+    if name == state_.drivingMode then return end
+    state_.drivingMode = name
+    if refs_.drivingMode then refs_.drivingMode:SetText("驾驶 · " .. name) end
+end
+
+---@param name string 流畅 / 细致，由 main 回传实际性能档位
+function Hud.SetRenderQuality(name)
+    if name == state_.renderQuality then return end
+    state_.renderQuality = name
+    if refs_.renderQuality then refs_.renderQuality:SetText("画质 · " .. name) end
+end
+
+--- 目录是 Camera 的真实 id/name；不硬编码 16 个展示标签或猜测其顺序。
+---@param catalog CabCameraCatalogEntry[]?
+---@param selectedId string?
+function Hud.SetCameraCatalog(catalog, selectedId)
+    cameraCatalog_ = {}
+    for _, entry in ipairs(catalog or {}) do
+        cameraCatalog_[#cameraCatalog_ + 1] = {
+            id = entry.id, name = DisplayName(entry.name, entry.id, "待同步视角"),
+        }
+    end
+    if refs_.cameraSelector then refs_.cameraSelector:SetCatalog(cameraCatalog_) end
+    local id = selectedId or state_.selectedCameraId
+    for _, entry in ipairs(cameraCatalog_) do
+        if entry.id == id then Hud.SetCameraMode(id, entry.name); return end
+    end
+    if selectedId then Hud.SetCameraMode(selectedId, nil) end
+end
+
+---@param id string
+---@param name string?
+function Hud.SetCameraMode(id, name)
+    local resolved = name
+    if not resolved or resolved == "" or resolved == id then
+        for _, entry in ipairs(cameraCatalog_) do if entry.id == id then resolved = entry.name; break end end
+    end
+    local value = DisplayName(resolved, id, "待同步视角")
+    if id == state_.selectedCameraId and value == state_.selectedCameraName then return end
+    state_.selectedCameraId, state_.selectedCameraName = id, value
+    Text(refs_.cameraName, value)
+    if refs_.cameraSelector then refs_.cameraSelector:SetSelected(id, value) end
+end
+---@return boolean
+function Hud.IsCameraSelectorOpen()
+    return refs_.cameraSelector ~= nil and refs_.cameraSelector:IsOpen()
+end
+---@param open boolean
+function Hud.SetCameraSelectorOpen(open)
+    if not refs_.cameraSelector then return end
+    if open then
+        if not callbacks_.onSelectCamera or Hud.IsTrainSelectorOpen() then return end
+        refs_.cameraSelector:Open()
+    else refs_.cameraSelector:Close() end
+end
+
 function Hud.ShowBanner(title, sub)
     Text(refs_.bannerTitle, title or "")
     Text(refs_.bannerSub, sub or "")
     if refs_.banner then refs_.banner:Show() end
 end
+function Hud.ShowGameOver(reason)
+    Hud.SetTrainSelectorOpen(false)
+    Hud.SetCameraSelectorOpen(false)
+    if refs_.brake then refs_.brake:ReleaseHold() end
+    if refs_.gameOverReason then refs_.gameOverReason:SetText(reason) end
+    if refs_.gameOver then refs_.gameOver:Show() end
+end
+function Hud.HideGameOver() if refs_.gameOver then refs_.gameOver:Hide() end end
 function Hud.HideBanner()
     if refs_.banner then refs_.banner:Hide() end
 end
@@ -483,10 +994,14 @@ end
 ---@param paused boolean
 function Hud.SetPaused(paused)
     explicitPause_ = true
-    state_.paused = paused == true
-    if state_.paused and refs_.brake then refs_.brake:ReleaseHold() end
-    if refs_.pause then refs_.pause:SetActive(state_.paused) end
+    local value = paused == true
+    if value == state_.paused then return end
+    state_.paused = value
+    if value and refs_.brake then refs_.brake:ReleaseHold() end
+    if refs_.pause then refs_.pause:SetActive(value) end
+    statusDirty_ = true
     RefreshStatus()
+    RefreshOperations()
 end
 
 ---@param text string
@@ -497,12 +1012,17 @@ function Hud.Toast(text, seconds)
     state_.toastTime = math.max(0.1, Number(seconds, 2))
     -- 未迁移的旧 main 仍兼容文案协议；SetPaused 接入后只把 Toast 当提示。
     if not explicitPause_ then
+        local before = state_.paused
         if text == "已暂停" then
             state_.paused = true
             if refs_.brake then refs_.brake:ReleaseHold() end
         elseif text == "继续行驶" then state_.paused = false end
+        if before ~= state_.paused then
+            if refs_.pause then refs_.pause:SetActive(state_.paused) end
+            statusDirty_ = true
+            RefreshOperations()
+        end
     end
-    if refs_.pause then refs_.pause:SetActive(state_.paused) end
     RefreshStatus()
 end
 
@@ -541,16 +1061,25 @@ function Hud.SetMinimapTrain(x, z, activeIndex)
 end
 ---@param visible boolean
 function Hud.SetMinimapVisible(visible)
-    state_.mapVisible = visible == true
-    if refs_.map then refs_.map:SetVisible(state_.mapVisible) end
-    if refs_.mapKey then refs_.mapKey:SetActive(state_.mapVisible) end
+    local value = visible == true
+    if value == state_.mapVisible then return end
+    state_.mapVisible = value
+    if refs_.map then refs_.map:SetVisible(value) end
+    if refs_.mapKey then refs_.mapKey:SetActive(value) end
 end
 
 --- 目录由 main 从 Train.GetCatalog() 注入。允许 Init 前调用，不猜测初始车型。
 ---@param catalog CabTrainCatalogEntry[]?
 ---@param selectedId string?
 function Hud.SetTrainCatalog(catalog, selectedId)
-    trainCatalog_ = catalog or {}
+    trainCatalog_ = {}
+    for _, entry in ipairs(catalog or {}) do
+        trainCatalog_[#trainCatalog_ + 1] = {
+            id = entry.id, name = DisplayName(entry.name, entry.id, "待同步车型"),
+            kind = entry.kind, description = entry.description,
+            maxSpeedKmh = entry.maxSpeedKmh, ready = entry.ready,
+        }
+    end
     if refs_.trainSelector then refs_.trainSelector:SetCatalog(trainCatalog_) end
     local id = selectedId or state_.selectedTrainId
     for _, entry in ipairs(trainCatalog_) do
@@ -559,15 +1088,17 @@ function Hud.SetTrainCatalog(catalog, selectedId)
             return
         end
     end
-    if selectedId then Hud.SetSelectedTrain(selectedId, selectedId) end
+    if selectedId then Hud.SetSelectedTrain(selectedId, "待同步车型") end
 end
 
 --- 仅显示权威选择，不修改速度仪表或线路限速。
 ---@param id string
 ---@param name string
 function Hud.SetSelectedTrain(id, name)
-    state_.selectedTrainId = id or ""
-    state_.selectedTrainName = name and name ~= "" and name or "待同步车型"
+    local selectedId = id or ""
+    local selectedName = DisplayName(name, selectedId, "待同步车型")
+    if selectedId == state_.selectedTrainId and selectedName == state_.selectedTrainName then return end
+    state_.selectedTrainId, state_.selectedTrainName = selectedId, selectedName
     Text(refs_.trainName, state_.selectedTrainName)
     if refs_.trainSelector then
         refs_.trainSelector:SetSelected(state_.selectedTrainId, state_.selectedTrainName)
@@ -584,6 +1115,7 @@ end
 function Hud.SetTrainSelectorOpen(open)
     if not refs_.trainSelector then return end
     if open then
+        if refs_.cameraSelector then refs_.cameraSelector:Close() end
         if refs_.brake then refs_.brake:ReleaseHold() end
         refs_.trainSelector:Open()
     else refs_.trainSelector:Close() end
@@ -606,6 +1138,25 @@ end
 ---@field selectedTrainId string
 ---@field selectedTrainName string
 ---@field trainSelectorOpen boolean
+---@field selectedCameraId string
+---@field selectedCameraName string
+---@field cameraSelectorOpen boolean
+---@field cameraCount integer
+---@field drivingMode string
+---@field renderQuality string
+---@field railwayReady boolean
+---@field signalAspect string
+---@field signalText string
+---@field track string
+---@field switchText string
+---@field switchLocked boolean
+---@field objective string
+---@field serviceName string
+---@field passenger CabPassengerStatus
+---@field passengerSynced boolean
+---@field routeExpanded boolean
+---@field operationsExpanded boolean
+---@field soundEnabled boolean
 
 --- 返回显示值快照；仅供测试/验收，不允许修改 HUD 内部状态。
 ---@return CabHudReadings
@@ -614,6 +1165,15 @@ function Hud.GetReadings()
         selectedTrainId = state_.selectedTrainId,
         selectedTrainName = state_.selectedTrainName,
         trainSelectorOpen = Hud.IsTrainSelectorOpen(),
+        selectedCameraId = state_.selectedCameraId,
+        selectedCameraName = state_.selectedCameraName,
+        cameraSelectorOpen = Hud.IsCameraSelectorOpen(),
+        cameraCount = #cameraCatalog_, drivingMode = state_.drivingMode,
+        renderQuality = state_.renderQuality,
+        railwayReady = state_.railwayReady, signalAspect = state_.aspect,
+        signalText = state_.signalText, track = state_.track,
+        switchText = state_.switchText, switchLocked = state_.switchLocked, objective = state_.objective,
+        serviceName = state_.serviceName,
         speedKmh = state_.speed,
         speedLimitKmh = state_.limit,
         instrumentLimitKmh = refs_.meter and refs_.meter.limit_ or state_.limit,
@@ -623,6 +1183,9 @@ function Hud.GetReadings()
         reversing = state_.reversing, paused = state_.paused,
         stationName = state_.station, nextStation = state_.distance,
         mapVisible = state_.mapVisible,
+        passenger = Passenger.Snapshot(state_.passenger), passengerSynced = state_.passengerSynced,
+        routeExpanded = state_.routeExpanded, operationsExpanded = state_.operationsExpanded,
+        soundEnabled = state_.soundEnabled,
     }
     return readings
 end
@@ -635,6 +1198,9 @@ function Hud.GetRoot() return refs_.root end
 ---@return CabTrainSelector?
 function Hud.GetTrainSelector() return refs_.trainSelector end
 
+---@return CabCameraSelector?
+function Hud.GetCameraSelector() return refs_.cameraSelector end
+
 --- 返回仪表实际布局；单位为 UI 基准像素，不乘 DPR。
 ---@return table
 function Hud.GetLayout()
@@ -645,6 +1211,11 @@ function Hud.GetLayout()
         actions = refs_.actions and refs_.actions:GetAbsoluteLayout() or {},
         trainModel = refs_.trainBar and refs_.trainBar:GetAbsoluteLayout() or {},
         trainSelector = refs_.trainSelector and refs_.trainSelector.drawer_:GetAbsoluteLayout() or {},
+        cameraSelector = refs_.cameraSelector and refs_.cameraSelector:GetAbsoluteLayout() or {},
+        railwayControls = refs_.railwayControls and refs_.railwayControls:GetAbsoluteLayout() or {},
+        routeToggle = refs_.routeToggle and refs_.routeToggle:GetAbsoluteLayout() or {},
+        operationsToggle = refs_.operationsToggle and refs_.operationsToggle:GetAbsoluteLayout() or {},
+        passenger = refs_.passenger and refs_.passenger:GetAbsoluteLayout() or {},
         scale = UI.GetScale(),
     }
 end
@@ -655,15 +1226,26 @@ function Hud.Update(dt)
     -- 由 UI 单次自动更新负责，暂停时仍可交互，不在此重复推进。
     RefreshStatus()
 end
-function Hud.Shutdown()
+---@param keepUI boolean? 页面切换时保留共享 UI；应用结束/独立测试才关闭。
+function Hud.Shutdown(keepUI)
+    if refs_.cameraSelector then refs_.cameraSelector:Close() end
     if refs_.trainSelector then refs_.trainSelector:Close() end
     if refs_.brake then refs_.brake:ReleaseHold() end
-    UI.Shutdown()
+    if not keepUI then UI.Shutdown() end
     refs_ = {}
     callbacks_ = {}
-    trainCatalog_ = {}
+    trainCatalog_, cameraCatalog_ = {}, {}
     explicitPause_ = false
     state_.selectedTrainId, state_.selectedTrainName = "", "待同步车型"
+    state_.selectedCameraId, state_.selectedCameraName = "", "待同步视角"
+    state_.railwayReady, state_.switchLocked = false, true
+    state_.aspect, state_.signalText, state_.track = "unknown", "信号待同步", "线路待同步"
+    state_.switchText, state_.objective, state_.drivingMode = "道岔待同步", "运营任务待同步", "待同步"
+    state_.serviceName = ""
+    state_.renderQuality = "流畅"
+    state_.routeExpanded, state_.operationsExpanded = false, false
+    state_.passengerSynced, state_.passenger = false, Passenger.Snapshot(nil)
+    state_.soundEnabled = true
 end
 
 return Hud

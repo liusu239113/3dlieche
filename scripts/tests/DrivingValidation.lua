@@ -33,10 +33,10 @@ function Start()
     local elapsed = os.clock() - started
     print(string.format("[DrivingValidation] 主入口CPU启动 %.3fs", elapsed))
     assert(elapsed < 10, "主入口同步CPU启动仍超过10秒")
-    assert(Route.GetLength() > 90000, "仍是旧小环线")
+    assert(not Route.IsClosed() and Route.GetLength() > 60000, "不是有端点的长距离走廊")
     assert(Route.GetValidationData().minRadius >= 9000, "未使用大半径曲线")
     assert(Train.GetSelectedId() == "CR400AF", "默认不是复兴号")
-    assert(Game.GetSpeedLimit() == 350, "区间仍不是复兴号350")
+    assert(Game.GetSpeedLimit() == 60, "站内开局没有独立60限速")
     assert(Hud.GetReadings().instrumentMaxKmh >= 350, "速度表仍是旧120量程")
     -- 使用真实缓解和W档按钮；不直接调回调代替触控。
     -- 真实按钮缓解，然后连续点击八次牵引+键；下一帧读回权威档位。
@@ -74,7 +74,10 @@ function HandleDrivingValidation(eventType, eventData)
         Game.UpdateHud(0)
         tap("openTrainSelector")
         local selector = assert(Hud.GetTrainSelector())
-        while selector:GetPage() < selector:GetPageCount() do tap("nextTrainPage") end
+        for _ = 1,selector:GetPageCount() do
+            if assert(Hud.GetRoot()):FindById("selectTrain_CRH380A") then break end
+            tap("nextTrainPage")
+        end
         tap("selectTrain_CRH380A")
         tap("confirmTrain")
         assert(Train.GetSelectedId() == "CRH380A", "真实分页确认没有切换和谐号")
@@ -90,17 +93,23 @@ function HandleDrivingValidation(eventType, eventData)
         Train.SetThrottle(8)
         Camera.SetMode("cab")
     elseif frame_ == 210 then
-        assert(Stream.GetStats().nearRailChunks > 0, "闭合接缝没有近景轨道")
-        print(string.format("[DrivingValidation] 闭合接缝/流式PASS: 常驻峰值%d, 切片峰值%.3fms",
+        assert(Stream.GetStats().nearRailChunks > 0, "开放端点没有近景轨道")
+        assert(Train.GetS() <= Route.GetLength() - 20 and Train.GetS() > Route.GetLength() - 200,
+            "开放端点错误环回首站")
+        print(string.format("[DrivingValidation] 开放端点/流式PASS: 常驻峰值%d, 切片峰值%.3fms",
             maxChunks_, Stream.GetStats().maxTaskMs))
         Train.Reset(Route.GetStations()[1].s + 600)
         Stream.Reset(Train.GetS())
         Game.Init()
         assert(SelectTrain("CR400AF"))
+        -- 能力验收使用原SI模式，积分到构造速度后停止；不能继续600s穿越开放线路端点。
+        assert(Train.SetDrivingMode("simulation"))
         Train.SetBrake(0)
         Train.SetThrottle(8)
-        -- CPU按真实动力积分600秒，不直接写速度；跳过站停用于能力验收。
-        for _ = 1, 6000 do Train.Update(.1) end
+        for _ = 1, 6000 do
+            Train.Update(.1)
+            if Train.GetSpeedKmh() >= 349 then break end
+        end
         assert(Train.GetSpeedKmh() >= 349, "复兴号实际动力积分达不到350")
         Train.UpdateVisuals(0)
         Stream.Reset(Train.GetS())

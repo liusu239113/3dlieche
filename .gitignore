@@ -46,3 +46,7 @@ assets/image/
 .agents/
 .opencode/
 screenshots/
+
+# Validation outputs & runtime save
+.validation/
+railway_autosave_v1.json

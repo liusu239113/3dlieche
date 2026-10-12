@@ -9,8 +9,9 @@ local Catalog = require "config.TrainCatalog"
 local Locomotive = {}
 
 local MODEL_PATH = "model/228b03702ab649048d477f0df9bf5feb/Meshes/228b03702ab649048d477f0df9bf5feb.mdl"
-local DIFFUSE_PATH = "model/228b03702ab649048d477f0df9bf5feb/Textures/228b03702ab649048d477f0df9bf5feb_00_D.jpg"
-local NORMAL_PATH = "model/228b03702ab649048d477f0df9bf5feb/Textures/228b03702ab649048d477f0df9bf5feb_00_N.png"
+local CLASSIC_ASSET = assert(Catalog.Assets.blue_white)
+local DIFFUSE_PATH = CLASSIC_ASSET.diffusePath
+local NORMAL_PATH = CLASSIC_ASSET.normalPath
 
 Locomotive.Length = 21.0
 local WIDTH = 3.1
@@ -309,4 +310,5 @@ function Locomotive.SetCabView(enabled)
     if drawable_ then drawable_.enabled = not enabled end
 end
 
+function Locomotive.ForgetLead() drawable_=nil;cabView_=false end
 return Locomotive

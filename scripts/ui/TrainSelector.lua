@@ -137,7 +137,7 @@ function Selector:SetCatalog(catalog)
         if type(entry.id) == "string" and entry.id ~= "" and not seen[entry.id] then
             seen[entry.id] = true
             copy[#copy + 1] = {
-                id = entry.id, name = entry.name or entry.id, kind = entry.kind or "待补充",
+                id = entry.id, name = entry.name or "未命名车队车辆", kind = entry.kind or "待补充",
                 description = entry.description or "车型与编组介绍待补充。",
                 maxSpeedKmh = entry.maxSpeedKmh or 0, ready = entry.ready == true,
             }

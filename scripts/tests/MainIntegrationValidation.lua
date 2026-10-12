@@ -25,6 +25,20 @@ local function tapButton(id)
     UI.InputAdapter.HandleTouchEnd(990, x, y)
 end
 
+local function selectCatalogTrain(id)
+    local selector = assert(Hud.GetTrainSelector())
+    for _ = 1,selector:GetPageCount() do
+        if assert(Hud.GetRoot()):FindById("selectTrain_"..id) then
+            tapButton("selectTrain_"..id)
+            return
+        end
+        local before = selector:GetPage()
+        tapButton("nextTrainPage")
+        assert(selector:GetPage() ~= before, "下一页按钮没有推进车型页码")
+    end
+    error("所有车型页均没有目标车型："..id)
+end
+
 local function step()
     local data = VariantMap()
     data["TimeStep"] = Variant(0.1)
@@ -41,7 +55,12 @@ function Start()
     assert(dimensions.maxTrainWidth >= 3.38 and dimensions.sideGap >= .20,
         "站台没有为最大宽度动车保留净空")
     assert(Hud.GetReadings().selectedTrainId == Train.GetSelectedId(), "初始显示车型不一致")
-    Train.Reset(Route.GetStations()[1].s - 120)
+    local firstStation = Route.GetStations()[1]
+    assert(math.abs(Train.GetS()-(firstStation.s+1)) < .01, "开局没有位于北京站内")
+    assert(Game.GetNextStation().index == Route.GetStations()[2].index, "开局站序不是下一站天津")
+    Game.CheckArrival()
+    assert(Game.GetXp() == 0 and not Game.IsDwelling(), "出生原地误发到站奖励")
+    Train.Reset(firstStation.s - 120)
 
     local elapsed, s = Game.GetElapsed(), Train.GetS()
     tapButton("openTrainSelector")
@@ -114,13 +133,8 @@ function HandleIntegrationUpdate(eventType, eventData)
     if frame_ == 124 then tapButton("openTrainSelector") end
     if frame_ == 127 then
         local selector = assert(Hud.GetTrainSelector())
-        for _ = 2, selector:GetPageCount() do
-            local before = selector:GetPage()
-            tapButton("nextTrainPage")
-            assert(selector:GetPage() == before + 1, "下一页按钮没有推进车型页码")
-        end
         assert(selector:GetPageCount() >= 3, "车型分页数量不正确")
-        tapButton("selectTrain_CRH380A")
+        selectCatalogTrain("CRH380A")
         assert(selector.pendingId_ == "CRH380A", "翻页后和谐号选择按钮未命中")
         tapButton("confirmTrain")
         assert(Train.GetSelectedId() == "CRH380A", "和谐号真实确认未切换编组")
@@ -159,11 +173,11 @@ end
 ---@param eventType string
 ---@param eventData EndRenderingEventData
 function HandleIntegrationCapture(eventType, eventData)
-    if frame_ == 121 or frame_ == 132 or frame_ == 140 or frame_ == 165 or frame_ == 180 then
+    if frame_ == 123 or frame_ == 132 or frame_ == 140 or frame_ == 165 or frame_ == 180 then
         local image = Image()
         assert(graphics:TakeScreenShot(image), "实际帧截图失败")
         local names = {
-            [121] = "modern_station", [132] = "train_selector", [140] = "modern_harmony_station",
+            [123] = "modern_station", [132] = "train_selector", [140] = "modern_harmony_station",
             [165] = "modern_curve", [180] = "modern_cab",
         }
         local name = assert(names[frame_])

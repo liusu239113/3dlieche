@@ -1,13 +1,13 @@
 {
   "$schema": "../schemas/project.schema.json",
-  "project_id": "m_xs3f",
+  "project_id": "m_7h6f",
   "author": {
     "id": "655765888"
   },
   "entry": "main.lua",
   "version": "1.0.0",
   "taptap_publish": {
-    "title": "火车驾驶模拟",
+    "title": "星澜群域 · 铁路旅程",
     "description": "",
     "category": "simulation",
     "screen_orientation": "landscape",

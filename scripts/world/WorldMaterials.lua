@@ -21,6 +21,7 @@ function WorldMaterials.Textured(key, texturePath, color, roughness, metallic)
         return materials_[key]
     end
     texture:SetSRGB(true)
+    texture:SetFilterMode(FILTER_ANISOTROPIC)
     texture:SetAnisotropy(4)
     local material = Material:new()
     material:SetTechnique(0, technique)
@@ -55,6 +56,7 @@ end
 ---@field geometry CustomGeometry
 ---@field tile number
 ---@field vertices integer
+---@field needsTangents boolean
 local Batch = {}
 Batch.__index = Batch
 
@@ -76,6 +78,7 @@ function Batch:Init(node, material, shadows, tile)
     self.geometry:SetMaterial(material)
     self.tile = tile or 1
     self.vertices = 0
+    self.needsTangents = material:GetTexture(TU_NORMAL) ~= nil
 end
 
 ---@param p Vector3
@@ -135,6 +138,39 @@ function Batch:AddBox(center, size, yaw)
     self:AddQuad(b, c, g, f)
 end
 
+-- 合批圆管：端点已经过线路变换，不能用每根一个 StaticModel 增加节点/批次。
+-- 侧面使用径向平滑法线；封口独立法线，适用于钢柱、斜撑和弯管分段。
+---@param a Vector3
+---@param b Vector3
+---@param radius number
+---@param segments? integer
+function Batch:AddTube(a, b, radius, segments)
+    local delta = b - a
+    local length = delta:Length()
+    if length < .00001 or radius <= 0 then return end
+    local axis = delta / length
+    local reference = math.abs(axis.y) < .9 and Vector3.UP or Vector3.RIGHT
+    local u = axis:CrossProduct(reference):Normalized()
+    local v = axis:CrossProduct(u):Normalized()
+    local count = segments or 8
+    for i = 1, count do
+        local t0, t1 = (i - 1) * math.pi * 2 / count, i * math.pi * 2 / count
+        local n0 = u * math.cos(t0) + v * math.sin(t0)
+        local n1 = u * math.cos(t1) + v * math.sin(t1)
+        local p0, p1 = a + n0 * radius, a + n1 * radius
+        local q0, q1 = b + n0 * radius, b + n1 * radius
+        local s0, s1 = (i - 1) / count, i / count
+        self:Vertex(p0, Vector2(s0, 0), n0)
+        self:Vertex(p1, Vector2(s1, 0), n1)
+        self:Vertex(q1, Vector2(s1, length / self.tile), n1)
+        self:Vertex(p0, Vector2(s0, 0), n0)
+        self:Vertex(q1, Vector2(s1, length / self.tile), n1)
+        self:Vertex(q0, Vector2(s0, length / self.tile), n0)
+        self:AddTri(a, p1, p0)
+        self:AddTri(b, q0, q1)
+    end
+end
+
 -- 非对称椭球树冠，轻微方位扰动打破玩具轮廓。
 -- 不生成大锥体或球头圆柱人；树冠法线平滑，保持自然低饱和颜色。
 ---@param center Vector3
@@ -171,7 +207,7 @@ end
 ---@return integer
 function Batch:Finish()
     if self.vertices > 0 then
-        self.geometry:GenerateTangents()
+        if self.needsTangents then self.geometry:GenerateTangents() end
         self.geometry:Commit()
     else
         self.geometry:Dispose()

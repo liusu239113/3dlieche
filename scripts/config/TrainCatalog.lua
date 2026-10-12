@@ -1,5 +1,7 @@
--- 中国车型目录。尺寸为米，速度为构造速度；不是当前环线的线路限速。
--- 资产校准只属于对应模型，原蓝白机车仍由Locomotive的专用算法处理。
+-- 星澜群域虚构车队目录。尺寸为米，速度为模拟设计值；不是线路限速。
+-- 六个稳定内部ID与全部几何/轮轨校准保持不变，只用于加载和存档，禁止作为玩家车型名。
+-- 既有模型搭配本地派生架空涂装；不是完全原创模型，也不代表现实铁路或制造商。
+local FictionalWorld = require "config.FictionalWorld"
 
 ---@class RollingStockContactBox
 ---@field x0 number
@@ -8,6 +10,36 @@
 ---@field y1 number
 ---@field z0 number
 ---@field z1 number
+
+---@class RollingStockEndFace
+---@field kind string flat|nose（来自实测，不根据head/middle名字推断）
+---@field center Vector3 成品MDL坐标，端面轴向法线采样的中位平面
+---@field width number 端面平面±slabDepth内车体截面实测宽
+---@field height number 同一截面实测高，不使用全模型BBox高度
+---@field outward number # +Z端=1，-Z端=-1
+---@field slabDepth number 实测截面半厚度，也是风挡接缝嵌入深度
+---@field samples integer 轴向法线平面有效样本数
+---@field measured boolean
+
+---@class RollingStockEndSurvey
+---@field sourceChecksum number 绑定离线成品元数据的源网格校验值
+---@field method string
+---@field bodyYMin number 端面采样ROI，排除轮区及车钩
+---@field bodyYMax number
+---@field axialYMin number 平面定位用ROI
+---@field axialYMax number
+---@field axialXMax number
+---@field terminalZ number 端面搜索纵向下限
+---@field front RollingStockEndFace|nil
+---@field rear RollingStockEndFace|nil
+
+---@class EMURoleProfile
+---@field profile string
+---@field reverse boolean|nil 尾车可复用头车并旋转180度，独立尾车也支持
+
+---@class EMUFormationCar
+---@field number string
+---@field service string motor|trailer|dining（模拟编组标识，不声称工程精确）
 
 ---@class RollingStockProfile
 ---@field id string
@@ -26,6 +58,10 @@
 ---@field description string
 ---@field roofSource number|nil 源网格车顶基准，受电弓从该点以上独立缩放
 ---@field roofHeight number|nil 对应米制车顶高度（轨面为零）
+---@field expectedShape string|nil single_cab|double_flat
+---@field appearanceStatus string|nil accepted|rejected|pending，仅外观验收，不是轮轨verified
+---@field appearanceIssue string|nil
+---@field endSurvey RollingStockEndSurvey|nil 离线实测；运行时不读取顶点
 
 ---@class TrainCatalogEntry
 ---@field id string
@@ -37,7 +73,10 @@
 ---@field serviceDeceleration number 保守服务制动 m/s²
 ---@field head string RollingStockProfile.id，blue_white为专用旧资产
 ---@field middle string|nil
----@field gap number 车辆完整包络间隙
+---@field roles {head:EMURoleProfile,middle:EMURoleProfile,tail:EMURoleProfile}|nil
+---@field formation EMUFormationCar[]|nil 每节编号/服务差异，模型与涂装仍共享
+---@field connectionGap number|nil 平端之间设计距离，与完整BBox gap分开
+---@field gap number 车辆完整包络间隙（未测端面时仅作兼容，不生成假风挡）
 ---@field mass number 全编组质量 kg
 ---@field maxTractive number 轮周起动牵引力 N
 ---@field maxBrakeForce number 全编组最大制动力 N
@@ -111,6 +150,16 @@ TrainCatalog.Profiles = {
         underframeTop = -.084, transitionTop = -.053,
         description = "LOD0 yaw +24.431624°后鼻子在-Z；+Z为端门，按四视图复核鼻端需翻转180°。",
     },
+    CR400AF_middle_v2 = {
+        id="CR400AF_middle_v2",modelId="fb6db791acae4c95a0455e5270f4e417",
+        length=25.650,width=3.360,height=4.050,pivot=8.750,
+        cab=Vector3.ZERO,forwardSign=1,verified=true,
+        contactLeft={x0=-.081,x1=-.060,y0=-.166,y1=-.158,z0=-.49,z1=.49},
+        contactRight={x0=.072,x1=.084,y0=-.166,y1=-.158,z0=-.49,z1=.49},
+        underframeTop=-.125,transitionTop=-.065,
+        expectedShape="double_flat",appearanceStatus="pending",
+        description="新红白平端源已交付；LOD0 PCA yaw +42.806582°，左右朝下踏面ROI独立实测；待成品平端截面验收后接入。",
+    },
     CR400AF_middle = {
         id = "CR400AF_middle", modelId = "93b1cac4ba724bddb92d058ca9f04c2f",
         length = 25.650, width = 3.360, height = 4.050, pivot = 8.750,
@@ -122,37 +171,101 @@ TrainCatalog.Profiles = {
     },
 }
 
+-- 成品LOD0实测记录：轴向法线>0.90，0.10m分箱定位平面，±0.18m车体截面。
+-- 有效平端连接按其平面计算；尖鼻永远不是连接端，不能加长风挡掩盖错误模型。
+local END_METHOD = "baked_lod0_axial_bins_0.10_slab_0.18_v1"
+
+---@param x number
+---@param y number
+---@param z number
+---@param width number
+---@param height number
+---@param outward number
+---@param samples integer
+---@param kind string
+---@return RollingStockEndFace
+local function endFace(x, y, z, width, height, outward, samples, kind)
+    return {center=Vector3(x,y,z), width=width, height=height, outward=outward,
+        samples=samples, kind=kind, slabDepth=.18, measured=true}
+end
+
+local headAF = assert(TrainCatalog.Profiles.CR400AF_head)
+headAF.expectedShape, headAF.appearanceStatus = "single_cab", "accepted"
+headAF.endSurvey = {sourceChecksum=3151141751, method=END_METHOD,
+    bodyYMin=1.3, bodyYMax=3.8, axialYMin=1.5, axialYMax=3.5, axialXMax=1.2, terminalZ=8,
+    rear=endFace(.035744,2.521977,-13.000671,2.885301,2.417442,-1,27,"flat")}
+local middleAF = assert(TrainCatalog.Profiles.CR400AF_middle)
+middleAF.expectedShape, middleAF.appearanceStatus = "double_flat", "rejected"
+middleAF.appearanceIssue = "星澜 M35的备用中间车仍有尖鼻且端面偏窄，仅保留内部诊断；运营编组使用已验收双平端中间车。"
+middleAF.endSurvey = {sourceChecksum=3088468763, method=END_METHOD,
+    bodyYMin=1.3, bodyYMax=3.8, axialYMin=1.5, axialYMax=3.5, axialXMax=1.2, terminalZ=8,
+    rear=endFace(.023238,2.277590,-12.774679,2.055671,1.952158,-1,24,"flat"),
+    front=endFace(.017496,2.292158,11.519757,2.428916,1.515108,1,16,"nose")}
+local middleAFv2 = assert(TrainCatalog.Profiles.CR400AF_middle_v2)
+middleAFv2.appearanceStatus = "accepted"
+middleAFv2.description = "用户确认红白新双平端，LOD0 PCA +42.806582°；成品端面±12.0m全宽实测，中央突出端门不作为车体锚点，车顶与头车相差0.024m。"
+middleAFv2.endSurvey = {sourceChecksum=403007193, method="baked_lod0_axial_fullwidth_bins_0.10_slab_0.18_v2",
+    bodyYMin=1.3,bodyYMax=3.8,axialYMin=1.3,axialYMax=3.8,axialXMax=1.68,terminalZ=8,
+    rear=endFace(-.002469,2.554473,-12.016738,3.308769,2.486842,-1,22,"flat"),
+    front=endFace(-.005813,2.542632,12.003050,3.291262,2.463158,1,12,"flat")}
+
+local headCRH = assert(TrainCatalog.Profiles.CRH380A_head)
+headCRH.expectedShape, headCRH.appearanceStatus = "single_cab", "accepted"
+local middleCRH = assert(TrainCatalog.Profiles.CRH380A_middle)
+middleCRH.expectedShape, middleCRH.appearanceStatus = "double_flat", "accepted"
+-- 校验值从已交付小JSON取得；不要给尚未完成的新模型编造checksum/端面。
+headCRH.endSurvey = {sourceChecksum=1162201738, method=END_METHOD,
+    bodyYMin=1.3, bodyYMax=3.8, axialYMin=1.5, axialYMax=3.5, axialXMax=1.2, terminalZ=8,
+    rear=endFace(-.057363,2.556337,-12.233832,3.143143,2.454455,-1,78,"flat")}
+middleCRH.endSurvey = {sourceChecksum=3146252007, method=END_METHOD,
+    bodyYMin=1.3, bodyYMax=3.8, axialYMin=1.5, axialYMax=3.5, axialXMax=1.2, terminalZ=8,
+    rear=endFace(.004872,2.595238,-11.716998,3.241090,2.396190,-1,119,"flat"),
+    front=endFace(.013623,2.595238,11.717299,3.203405,2.396190,1,114,"flat")}
+
+-- 默认只复用已有涂装：编号置于端面小标识，不添加盖住红白纹理的车身蒙版/屋顶件。
+---@type EMUFormationCar[]
+local EMU_FORMATION = {
+    {number="01",service="trailer"}, {number="02",service="motor"},
+    {number="03",service="motor"}, {number="04",service="trailer"},
+    {number="05",service="dining"}, {number="06",service="motor"},
+    {number="07",service="motor"}, {number="08",service="trailer"},
+}
+
 -- 模拟调校参数，不声称工程精确。R=A+B*v+C*v² 为全编组阻力(N)，v用m/s。
 -- 机车质量含7×52t客车；动车质量为8节总质量。P为轮周可用W，非电源输入功率。
 ---@type TrainCatalogEntry[]
 TrainCatalog.Entries = {
-    { id = "blue_white", name = "蓝白经典内燃机车", kind = "locomotive", head = "blue_white", gap = 1.025,
-        description = "原蓝白机车+7客车，专用校准已离线缓存；模拟运营120km/h。", maxSpeedKmh = 120,
+    { id = "blue_white", name = FictionalWorld.trainNames.blue_white, kind = "locomotive", head = "blue_white", gap = 1.025,
+        description = "群域行旅联队的沧羽系内燃机车，海青与暖金航迹涂装；牵引7节云舟客车，模拟运营120km/h。", maxSpeedKmh = 120,
         operatingSpeedKmh = 120, serviceDeceleration = .5,
         mass = 502000, maxTractive = 300000, maxBrakeForce = 450000, powerW = 2400000,
         resistA = 9000, resistB = 100, resistC = 25 },
-    { id = "DF4D", name = "东风4D", kind = "locomotive", head = "DF4D", gap = .35,
-        description = "中国客运内燃机车，1机车+7客车；模拟运营160km/h。", maxSpeedKmh = 170,
+    { id = "DF4D", name = FictionalWorld.trainNames.DF4D, kind = "locomotive", head = "DF4D", gap = .35,
+        description = "赤峦系山域内燃机车，赤铜与暮金车队涂装；牵引7节云舟客车，模拟运营160km/h。", maxSpeedKmh = 170,
         operatingSpeedKmh = 160, serviceDeceleration = .5,
         mass = 502000, maxTractive = 330000, maxBrakeForce = 460000, powerW = 3300000,
         resistA = 9000, resistB = 90, resistC = 22 },
-    { id = "SS9G", name = "韶山9G", kind = "locomotive", head = "SS9G", gap = .35,
-        description = "中国客运电力机车，1机车+7客车；模拟运营160km/h。", maxSpeedKmh = 170,
+    { id = "SS9G", name = FictionalWorld.trainNames.SS9G, kind = "locomotive", head = "SS9G", gap = .35,
+        description = "苍穹系双端电力机车，靛青与香槟航迹涂装；牵引7节云舟客车，模拟运营160km/h。", maxSpeedKmh = 170,
         operatingSpeedKmh = 160, serviceDeceleration = .5,
         mass = 490000, maxTractive = 320000, maxBrakeForce = 450000, powerW = 4800000,
         resistA = 8500, resistB = 90, resistC = 22 },
-    { id = "HXD3D", name = "和谐3D", kind = "locomotive", head = "HXD3D", gap = .35,
-        description = "双驾驶室电力机车，1机车+7客车；模拟运营160km/h。", maxSpeedKmh = 160,
+    { id = "HXD3D", name = FictionalWorld.trainNames.HXD3D, kind = "locomotive", head = "HXD3D", gap = .35,
+        description = "雷隼系干线电力机车，紫晶与浅银车队涂装；牵引7节云舟客车，模拟运营160km/h。", maxSpeedKmh = 160,
         operatingSpeedKmh = 160, serviceDeceleration = .5,
         mass = 490000, maxTractive = 330000, maxBrakeForce = 460000, powerW = 6000000,
         resistA = 8500, resistB = 85, resistC = 21 },
-    { id = "CRH380A", name = "和谐号 CRH380A", kind = "emu", head = "CRH380A_head", middle = "CRH380A_middle", gap = .25,
-        description = "8节：头+6中间+反向尾；模拟运营300km/h，构造380km/h。", maxSpeedKmh = 380,
+    { id = "CRH380A", name = FictionalWorld.trainNames.CRH380A, kind = "emu", head = "CRH380A_head", middle = "CRH380A_middle", gap = .25,
+        roles={head={profile="CRH380A_head"},middle={profile="CRH380A_middle"},tail={profile="CRH380A_head",reverse=true}},
+        formation=EMU_FORMATION, connectionGap=.35,
+        description = "流萤系群域快行动车，月白与青绿双棱航迹涂装；8节固定编组，模拟运营300km/h。", maxSpeedKmh = 380,
         operatingSpeedKmh = 300, serviceDeceleration = .7,
         mass = 420000, maxTractive = 320000, maxBrakeForce = 500000, powerW = 8800000,
         resistA = 5000, resistB = 50, resistC = 6.5 },
-    { id = "CR400AF", name = "复兴号 CR400AF", kind = "emu", head = "CR400AF_head", middle = "CR400AF_middle", gap = .25,
-        description = "8节：头+6中间+反向尾；模拟运营350km/h，非统一限速80。", maxSpeedKmh = 350,
+    { id = "CR400AF", name = FictionalWorld.trainNames.CR400AF, kind = "emu", head = "CR400AF_head", middle = "CR400AF_middle_v2", gap = .25,
+        roles={head={profile="CR400AF_head"},middle={profile="CR400AF_middle_v2"},tail={profile="CR400AF_head",reverse=true}},
+        formation=EMU_FORMATION, connectionGap=.35,
+        description = "星澜系群域旗舰动车，雾银与紫蓝双棱航迹涂装；8节固定编组，模拟运营350km/h。", maxSpeedKmh = 350,
         operatingSpeedKmh = 350, serviceDeceleration = .7,
         mass = 430000, maxTractive = 330000, maxBrakeForce = 515000, powerW = 9750000,
         resistA = 5200, resistB = 48, resistC = 6.2 },
@@ -168,22 +281,23 @@ TrainCatalog.Entries = {
 ---@type table<string, RollingStockAsset>
 TrainCatalog.Assets = {
     blue_white = { modelPath = "RollingStockBaked/blue_white.mdl", metadataPath = "RollingStockBaked/blue_white.json",
-        diffusePath = "model/228b03702ab649048d477f0df9bf5feb/Textures/228b03702ab649048d477f0df9bf5feb_00_D.jpg",
-        normalPath = "model/228b03702ab649048d477f0df9bf5feb/Textures/228b03702ab649048d477f0df9bf5feb_00_N.png" },
+        diffusePath = "FictionalLiveries/Cangyu_D12_D.png", normalPath = "FictionalLiveries/Cangyu_D12_N.png" },
     DF4D = { modelPath = "RollingStockBaked/DF4D.mdl", metadataPath = "RollingStockBaked/DF4D.json",
-        diffusePath = "RollingStockBaked/DF4D_D.jpg", normalPath = "RollingStockBaked/DF4D_N.png" },
+        diffusePath = "FictionalLiveries/Chiluan_D18_D.png", normalPath = "FictionalLiveries/Chiluan_D18_N.png" },
     SS9G = { modelPath = "RollingStockBaked/SS9G.mdl", metadataPath = "RollingStockBaked/SS9G.json",
-        diffusePath = "RollingStockBaked/SS9G_D.jpg", normalPath = "RollingStockBaked/SS9G_N.png" },
+        diffusePath = "FictionalLiveries/Cangqiong_E21_D.png", normalPath = "FictionalLiveries/Cangqiong_E21_N.png" },
     HXD3D = { modelPath = "RollingStockBaked/HXD3D.mdl", metadataPath = "RollingStockBaked/HXD3D.json",
-        diffusePath = "RollingStockBaked/HXD3D_D.jpg", normalPath = "RollingStockBaked/HXD3D_N.png" },
+        diffusePath = "FictionalLiveries/Leisun_E32_D.png", normalPath = "FictionalLiveries/Leisun_E32_N.png" },
     CRH380A_head = { modelPath = "RollingStockBaked/CRH380A_head.mdl", metadataPath = "RollingStockBaked/CRH380A_head.json",
-        diffusePath = "RollingStockBaked/CRH380A_head_D.jpg", normalPath = "RollingStockBaked/CRH380A_head_N.png" },
+        diffusePath = "FictionalLiveries/Liuying_M30_head_D.png", normalPath = "FictionalLiveries/Liuying_M30_head_N.png" },
     CRH380A_middle = { modelPath = "RollingStockBaked/CRH380A_middle.mdl", metadataPath = "RollingStockBaked/CRH380A_middle.json",
-        diffusePath = "RollingStockBaked/CRH380A_middle_D.jpg", normalPath = "RollingStockBaked/CRH380A_middle_N.png" },
+        diffusePath = "FictionalLiveries/Liuying_M30_middle_D.png", normalPath = "FictionalLiveries/Liuying_M30_middle_N.png" },
     CR400AF_head = { modelPath = "RollingStockBaked/CR400AF_head.mdl", metadataPath = "RollingStockBaked/CR400AF_head.json",
-        diffusePath = "RollingStockBaked/CR400AF_head_D.jpg", normalPath = "RollingStockBaked/CR400AF_head_N.png" },
+        diffusePath = "FictionalLiveries/Xinglan_M35_head_D.png", normalPath = "FictionalLiveries/Xinglan_M35_head_N.png" },
+    CR400AF_middle_v2 = { modelPath = "RollingStockBaked/CR400AF_middle_v2.mdl", metadataPath = "RollingStockBaked/CR400AF_middle_v2.json",
+        diffusePath = "FictionalLiveries/Xinglan_M35_middle_D.png", normalPath = "FictionalLiveries/Xinglan_M35_middle_N.png" },
     CR400AF_middle = { modelPath = "RollingStockBaked/CR400AF_middle.mdl", metadataPath = "RollingStockBaked/CR400AF_middle.json",
-        diffusePath = "RollingStockBaked/CR400AF_middle_D.jpg", normalPath = "RollingStockBaked/CR400AF_middle_N.png" },
+        diffusePath = "FictionalLiveries/Xinglan_M35_spare_D.png", normalPath = "FictionalLiveries/Xinglan_M35_spare_N.png" },
 }
 
 ---@param id string
