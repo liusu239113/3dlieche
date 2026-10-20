@@ -79,7 +79,10 @@ function AudioOutputUpdate(eventType, eventData)
             for _, loop in ipairs(diag.loops) do
                 if loop.trainId == Profiles.Ids[index_] then
                     check(loop.looped and loop.playing, "循环层停止或非循环")
-                    check(loop.rms > .01 and loop.peak <= .18, "生成素材静音或响度处理未生效")
+                    -- 旧断言 peak<=.18 是把"素材小到听不见"固化成了期望；
+                    -- 现在要求素材本身达到可听响度，且峰值留出混音余量不削顶。
+                    check(loop.rms > .06 and loop.peak > .18 and loop.peak <= .75,
+                        "生成素材响度不足或峰值过高")
                     check(loop.pitch==1 and loop.frequency==loop.sampleRate,"生成音效被升频拉尖")
                     check(loop.duration>25 and loop.resourcePath:find("comfort",1,true),"没有使用长生成循环音效")
                     check(loop.playCalls == 1, "每帧重复Play")

@@ -17,6 +17,7 @@ Cab.Panel = MetalPanel
 ---@class CabSpeedometerProps : WidgetProps
 ---@field maxSpeed? number
 ---@field limit? number
+---@field unlimited? boolean
 
 ---@class CabSpeedometer : Widget
 ---@overload fun(props?: CabSpeedometerProps): CabSpeedometer
@@ -25,6 +26,7 @@ Cab.Panel = MetalPanel
 ---@field needle_ number
 ---@field limit_ number
 ---@field maxSpeed_ number
+---@field unlimited_ boolean
 local Speedometer = UI.Widget:Extend("CabSpeedometer")
 
 ---@param props CabSpeedometerProps?
@@ -38,6 +40,17 @@ function Speedometer:Init(props)
     self.needle_ = 0
     self.limit_ = props.limit or 80
     self.maxSpeed_ = math.max(40, props.maxSpeed or 120)
+    self.unlimited_ = props.unlimited == true
+end
+
+---@param unlimited boolean
+function Speedometer:SetUnlimited(unlimited)
+    self.unlimited_ = unlimited == true
+end
+
+---@return string
+function Speedometer:GetLimitText()
+    return self.unlimited_ and "不限速" or ("限速 " .. math.floor(self.limit_ + 0.5))
 end
 
 ---@param maximum number
@@ -63,7 +76,7 @@ function Speedometer:Render(vg)
     local cx, cy = l.x + l.w * 0.5, l.y + l.h * 0.46
     local r = math.min(l.w, l.h) * 0.44
     if r <= 1 then return end
-    local over = self.speed_ > self.limit_ + 0.5
+    local over = not self.unlimited_ and self.speed_ > self.limit_ + 0.5
     local start = math.rad(135)
     local sweep = math.rad(270)
     nvgSave(vg)
@@ -98,7 +111,7 @@ function Speedometer:Render(vg)
         local outer = r * 0.86
         local inner = r * (major and 0.73 or 0.80)
         local cosA, sinA = math.cos(a), math.sin(a)
-        local color = value > self.limit_ and { 201, 132, 86, 165 } or { 199, 211, 205, 225 }
+        local color = not self.unlimited_ and value > self.limit_ and { 201, 132, 86, 165 } or { 199, 211, 205, 225 }
         Skin.Line(vg, cx + cosA * inner, cy + sinA * inner,
             cx + cosA * outer, cy + sinA * outer, color, major and 1.5 or 0.7)
         if major then
@@ -106,9 +119,11 @@ function Speedometer:Render(vg)
                 tostring(value), r * 0.13, C.secondary)
         end
     end
-    local limitAngle = start + sweep * math.min(1, self.limit_ / self.maxSpeed_)
-    Skin.Line(vg, cx + math.cos(limitAngle) * r * 0.91, cy + math.sin(limitAngle) * r * 0.91,
-        cx + math.cos(limitAngle) * r * 0.98, cy + math.sin(limitAngle) * r * 0.98, C.orange, 3)
+    if not self.unlimited_ then
+        local limitAngle = start + sweep * math.min(1, self.limit_ / self.maxSpeed_)
+        Skin.Line(vg, cx + math.cos(limitAngle) * r * 0.91, cy + math.sin(limitAngle) * r * 0.91,
+            cx + math.cos(limitAngle) * r * 0.98, cy + math.sin(limitAngle) * r * 0.98, C.orange, 3)
+    end
     Skin.Text(vg, cx, cy - r * 0.30, "速度", r * 0.11, C.muted)
 
     -- 阻尼指针、橙色针尖和小型中心轴承。
@@ -136,7 +151,7 @@ function Speedometer:Render(vg)
     nvgStrokeColor(vg, Skin.Color(over and C.red or { 192, 142, 91, 145 }))
     nvgStrokeWidth(vg, 1)
     nvgStroke(vg)
-    Skin.Text(vg, cx, by + bh * 0.5, "限速 " .. math.floor(self.limit_ + 0.5), r * 0.15,
+    Skin.Text(vg, cx, by + bh * 0.5, self:GetLimitText(), r * 0.15,
         over and C.red or C.orange, nil, true)
     for _, offset in ipairs({ -1, 1 }) do
         Skin.Screw(vg, cx + offset * r * 0.92, cy)
@@ -218,6 +233,24 @@ function Key:Render(vg)
         for i = 1, 2 do
             nvgBeginPath(vg)
             nvgArc(vg, ox + 12, cy, 4 + i * 4, -0.7, 0.7, NVG_CW)
+            nvgStroke(vg)
+        end
+    elseif icon == "volume" then
+        -- 喇叭本体与 horn 同形，区别在于这里只画两道短声波，表示音量调节。
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, ox - 2, cy - 3)
+        nvgLineTo(vg, ox + 5, cy - 3)
+        nvgLineTo(vg, ox + 12, cy - 8)
+        nvgLineTo(vg, ox + 12, cy + 8)
+        nvgLineTo(vg, ox + 5, cy + 3)
+        nvgLineTo(vg, ox - 2, cy + 3)
+        nvgClosePath(vg)
+        nvgStrokeColor(vg, Skin.Color(color))
+        nvgStrokeWidth(vg, 1.5)
+        nvgStroke(vg)
+        for i = 1, 2 do
+            nvgBeginPath(vg)
+            nvgArc(vg, ox + 12, cy, 3 + i * 3.5, -0.8, 0.8, NVG_CW)
             nvgStroke(vg)
         end
     elseif icon == "pause" then

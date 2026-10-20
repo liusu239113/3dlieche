@@ -82,7 +82,9 @@ function HandleUpdate(eventType,eventData)
             walkingSeen_=walkingSeen_ or stats.walking>0
             if frames_==32 then
                 check(stats.allocated<=36 and stats.created<=36,"人物池不断分配骨骼模型")
-                check(stats.skinned and stats.bonesPerActor==41 and stats.visible<=36,"仍是程序方块人")
+                check(stats.cpuBaked and not stats.skinned and stats.bonesPerActor==0
+                    and stats.sourceBones==41 and stats.sharedPoseFrames==50 and stats.geometryBuilds==0
+                    and stats.visible<=36,"人物未使用共享离线帧或仍依赖GPU骨矩阵")
                 check(walkingSeen_,"未见真实行走演员")
                 capture_=true
             end

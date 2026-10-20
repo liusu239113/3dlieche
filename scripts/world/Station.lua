@@ -4,16 +4,63 @@ local World = require "world.WorldMaterials"
 local Materials = require "config.Materials"
 local Vegetation = require "world.Vegetation"
 local StationBuildings = require "world.StationBuildings"
+local NightLighting = require "world.NightLighting"
+local ReferenceStation = require "world.ReferenceStation"
+local StationVisualConfig = require "config.StationVisualConfig"
 local Station = {}
 
--- 净空截面（局部X，米）：
--- 站房-68 | 外侧月台[-19.9,-12.9] | 上行lane1=-5 | 下行lane0=0
---         | 正岛台[1.9,8.9] | 到发lane2=10.8 | 货场（StationYard负责）
--- 最大3.38米车体占股道中心±1.69：正岛台两侧最小静态间隙0.21米；
--- 负台内边-12.9距上行车体外边-6.69为6.21米，家具/雨棚须随整台移-11米。
--- point统一映射原负台[-9.5,-1.5]，站房/站前广场不能跟随镜像整体挪动。
+-- 环境状态独立于流式站点：新建站直接继承当前因子；卸载先注销投光池灯位。
+local lampFactor_ = 0.0
+---@type table<number, boolean>
+local lampOwners_ = {}
+---@type table<string, Material>
+local signMaterials_ = {}
+
+---@param key string
+---@param color Color
+---@return Material
+local function signMaterial(key, color)
+    if not signMaterials_[key] then
+        local material = Material()
+        material:SetTechnique(0, assert(cache:GetResource("Technique", "Techniques/NoTextureUnlit.xml")))
+        material:SetShaderParameter("MatDiffColor", Variant(color))
+        signMaterials_[key] = material
+    end
+    return signMaterials_[key]
+end
+
+---@param lampFactor number 日间0、夜间1；可每帧调用，材质只在因子变化时更新
+function Station.SetEnvironment(lampFactor)
+    local factor = math.max(0, math.min(1, lampFactor))
+    if math.abs(factor-lampFactor_) < .005 then return end
+    lampFactor_ = factor
+    NightLighting.SetEnvironment(factor)
+    local diffuser = signMaterials_["lamp"]
+    if diffuser then
+        diffuser:SetShaderParameter("MatEmissiveColor", Variant(Vector3(1.20,1.04,.76)*factor))
+    end
+end
+
+---@return Material
+local function lampMaterial()
+    if not signMaterials_["lamp"] then
+        -- 独占材质，不改Materials.Solid缓存以免改变站外同色家具。
+        local material = Material()
+        material:SetTechnique(0, assert(cache:GetResource("Technique", "Techniques/PBR/PBRNoTexture.xml")))
+        material:SetShaderParameter("MatDiffColor", Variant(Color(.73,.72,.64)))
+        material:SetShaderParameter("Metallic", Variant(0.0))
+        material:SetShaderParameter("Roughness", Variant(.75))
+        material:SetShaderParameter("MatEmissiveColor", Variant(Vector3(1.20,1.04,.76)*lampFactor_))
+        signMaterials_["lamp"] = material
+    end
+    return signMaterials_["lamp"]
+end
+
+-- 净空截面（局部X，米）：站房-68 | 保留外台[-19.9,-12.9]
+-- 到发2=-10.8 | 岛台[-8.9,-1.9] | 下行0=0(+S) | 上行1=+5(-S) | 上行外台[6.9,13.9]。
+-- 仅迁移原正岛台，旧负外台/站房/城市不镜像；全站三座实际实体站台。
 -- 各棚只在对应月台上方，不跨股道/接触线；全线净空使用开放Route。
--- 站台绝对顶面=0.34+1.10=1.44 米，基座底面=-0.02 米。
+-- 站台相对轨基顶面=0.34+1.10=1.44米，基座底面=-0.02米；山地站全部叠加采样基高。
 -- 完整站台覆盖 [停靠点-225,停靠点+85] 及八节编组尾部。
 local INNER = 1.90
 local WIDTH = 7.0
@@ -26,6 +73,11 @@ local PLATFORM_Y = 1.44
 local CANOPY_INNER = 2.25
 local CANOPY_OUTER = 8.65
 local CANOPY_Y = PLATFORM_Y + 4.60
+local ELEVATED_DECK_TOP = PLATFORM_Y
+local ELEVATED_DECK_BOTTOM = -.18
+local ELEVATED_PIER_BOTTOM = -4.0
+local ELEVATED_PIER_STEP = 80.0
+local ELEVATED_PLATFORM_INDICES = {[1]=true,[5]=true}
 ---@type table[]
 local placementData_ = {}
 ---@type table<number, boolean>
@@ -101,6 +153,33 @@ local THEMES = {
       plazaLayout="interchange", planters={{x=-47,z=-25,width=10,depth=3.2},{x=-29,z=-25,width=10,depth=3.2}} },
 }
 
+-- 山地站使用独立的雨棚剖面、分段长度和候车密度，不能只换颜色复用城市站几何。
+local mountainThemes = {
+    {base=3,name="翠川山麓窄拱棚",city="翠川 · 田园山麓",exit="翠川山麓广场",roof=Color(.37,.45,.34),
+        ranges={{first=-132,last=18}},profile={{lateral=3.60,height=-.38},{lateral=4.55,height=-.12},{lateral=5.55,height=.02},{lateral=6.55,height=-.12},{lateral=8.65,height=-.52}},
+        supportStep=14,benches={-108,-72,-30,4},bins={-118,-46,10},lamps={-112,-84,-56,-28,0},plazaLayout="garden"},
+    {base=2,name="石门灰石分段棚",city="石门 · 岩岭门户",exit="石门岩岭广场",roof=Color(.35,.38,.37),
+        ranges={{first=-142,last=-96},{first=-88,last=-42},{first=-34,last=14}},profile={{lateral=2.25,height=-.22},{lateral=3.70,height=.02},{lateral=8.65,height=-.46}},
+        supportStep=12,benches={-122,-76,-24},bins={-132,-62,4},lamps={-126,-102,-78,-54,-30,-6},plazaLayout="harbour"},
+    {base=1,name="云脊木色双坡棚",city="云脊 · 林海山城",exit="云脊林海广场",roof=Color(.29,.38,.31),
+        ranges={{first=-158,last=32}},profile={{lateral=2.25,height=-.62},{lateral=5.45,height=-.02},{lateral=8.65,height=-.62}},
+        supportStep=11,benches={-136,-104,-70,-34,4,24},bins={-146,-92,-36,18},lamps={-140,-112,-84,-56,-28,0,24},plazaLayout="ceremonial"},
+    {base=4,name="松岚高地斜顶棚",city="松岚 · 高地风廊",exit="松岚观景广场",roof=Color(.67,.70,.60),
+        ranges={{first=-174,last=42}},profile={{lateral=2.25,height=.04},{lateral=4.05,height=-.10},{lateral=8.65,height=-.58}},
+        supportStep=16,benches={-150,-112,-74,-24,18},bins={-160,-88,-8,30},lamps={-152,-120,-88,-56,-24,8,34},plazaLayout="axis"},
+    {base=5,name="天池湖岸透光棚",city="天池 · 湖盆终点",exit="天池客运接驳广场",roof=Color(.36,.52,.56),
+        ranges={{first=-198,last=58}},profile={{lateral=2.25,height=-.12},{lateral=4.70,height=-.18},{lateral=7.15,height=-.25},{lateral=8.65,height=-.30}},
+        supportStep=19,benches={-174,-132,-90,-48,-6,30,52},bins={-184,-112,-40,44},lamps={-178,-140,-102,-64,-26,12,46},plazaLayout="interchange"},
+}
+for index,identity in ipairs(mountainThemes) do
+    local plan={}
+    for key,value in pairs(THEMES[identity.base]) do plan[key]=value end
+    plan.name,plan.cityLine,plan.exitLabel,plan.roof=identity.name,identity.city,identity.exit,identity.roof
+    plan.ranges,plan.profile,plan.supportStep=identity.ranges,identity.profile,identity.supportStep
+    plan.benches,plan.bins,plan.lamps,plan.plazaLayout=identity.benches,identity.bins,identity.lamps,identity.plazaLayout
+    THEMES[index+5]=plan --[[@as StationTheme ]]
+end
+
 ---@param st table
 ---@return StationTheme
 local function theme(st) return THEMES[st.index] or THEMES[1] end
@@ -137,7 +216,7 @@ local function point(st, along, lateral, y)
     -- 原负月台全部几何（板、棚、柱、文字/家具/盲道）同一入口搬迁；
     -- 不能把站房-68或前广场当作负侧月台一起搬走。
     local adjusted = lateral >= -9.5 and lateral <= -1.5
-        and lateral + NEGATIVE_PLATFORM_SHIFT or lateral
+        and lateral + NEGATIVE_PLATFORM_SHIFT or (lateral >= 1.5 and lateral <= 9.5 and -lateral or lateral)
     return Route.SampleOffset(st.s + along, adjusted, y)
 end
 ---@param root Node
@@ -168,11 +247,8 @@ local function roofStrip(target, st, side, first, last, a, b)
     local function p(ds, r, offset) return point(st,ds,side*r.lateral,CANOPY_Y+r.height+offset) end
     local u,v,w,x=p(first,a,halfThickness),p(last,a,halfThickness),p(last,b,halfThickness),p(first,b,halfThickness)
     local d,e,f,g=p(first,a,-halfThickness),p(last,a,-halfThickness),p(last,b,-halfThickness),p(first,b,-halfThickness)
-    if side>0 then
-        target:AddQuad(u,v,w,x); target:AddQuad(g,f,e,d)
-    else
-        target:AddQuad(x,w,v,u); target:AddQuad(d,e,f,g)
-    end
+    -- 两座旧月台现在都在负侧：原正台反射后也须翻转面绕序。
+    target:AddQuad(x,w,v,u); target:AddQuad(d,e,f,g)
     target:AddQuad(d,e,v,u); target:AddQuad(x,w,f,g)
     target:AddQuad(d,u,x,g); target:AddQuad(f,w,v,e)
 end
@@ -270,7 +346,7 @@ local function buildCityCanopies(root, st, roof, frame, pause)
         end
     end
     glazing:Finish(); if pause then pause() end
-    if st.index==5 then glazing.geometry.viewMask=6 end
+    if st.index==5 then glazing.geometry.viewMask=2 end
     drainage:Finish(); if pause then pause() end
     drainage.geometry.drawDistance=200
     details:Finish(); if pause then pause() end
@@ -280,13 +356,67 @@ end
 
 -- Text3D的可读正面沿局部-Z，不是+Z。文字分别位于不透明板两侧外部，
 -- 两面各自朝外，板身遮住另一面的镜像背面；不用反转字符串或负缩放。
+---@param root Node
+---@param st RailwayStation
+---@param along number
+---@param lateral number
+---@param y number
+---@param halfDepth number
+---@param text string|fun(face: number): string
+---@param size number
+---@param name string
 local function boardSigns(root, st, along, lateral, y, halfDepth, text, size, name)
     local _, _, yaw = Route.Sample(st.s)
     for face = -1, 1, 2 do
         local label = root:CreateChild(name .. (face > 0 and "_OuterFace" or "_InnerFace"))
         label.position = point(st, along, lateral + face * (halfDepth + .03), y)
-        label.rotation = Quaternion(yaw + (face > 0 and -90 or 90), Vector3.UP)
-        Station.MakeWorldSign(label, text, size)
+        -- 原正台反射后面偏移与法线须同时反转，避免把字面嵌进背板。
+        local worldFace=(lateral>=1.5 and lateral<=9.5) and -face or face
+        label.rotation = Quaternion(yaw + (worldFace > 0 and -90 or 90), Vector3.UP)
+        local faceText = type(text)=="function" and text(worldFace) or text
+        Station.MakeWorldSign(label, faceText --[[@as string]], size)
+    end
+end
+
+--- 站牌只读生产路线名称/顺序；开放端点不能虚构首尾相邻。
+---@param st RailwayStation
+function Station.GetSignInfo(st)
+    local stations = Route.GetStations()
+    local previous = stations[st.index-1]
+    local following = stations[st.index+1]
+    if Route.IsClosed() then
+        previous = previous or stations[#stations]
+        following = following or stations[1]
+    end
+    return {
+        name = st.name,
+        previousName = previous and previous.name or "线路起点",
+        nextName = following and following.name or "线路终点",
+        previousLabel = previous and "上站 "..previous.name or "线路起点",
+        nextLabel = following and "下站 "..following.name or "线路终点",
+        platform1 = "1 站台", platform2 = "2 站台",
+        nameSize = .68, approachNameSize = .82,
+        boardWidth = 5.8, boardHeight = 1.72,
+        centerAlong = ({-59,-66,-63,-68,-59})[st.index] or -63,
+    }
+end
+
+-- 进站识别牌横于线路，-Z/+Z各有独立正面；不billboard、不占股道净空。
+---@param root Node
+---@param st RailwayStation
+---@param along number
+---@param lateral number
+---@param y number
+---@param text string
+---@param size number
+---@param name string
+local function approachSigns(root, st, along, lateral, y, text, size, name)
+    local _, _, yaw = Route.Sample(st.s)
+    for face=-1,1,2 do
+        local label = root:CreateChild(name..(face<0 and "_ArrivalFace" or "_DepartureFace"))
+        label.position = point(st, along+face*.10, lateral, y)
+        label.rotation = Quaternion(yaw+(face<0 and 0 or 180),Vector3.UP)
+        Station.MakeWorldSign(label,text,size)
     end
 end
 
@@ -303,58 +433,91 @@ function Station.Build(scene, initialS)
     if best then Station.BuildOne(root,best) end
     return root
 end
-function Station.Init() placementData_ = {}; themeLogged_ = {} end
+-- 上行站台仅构建基座，连续雨棚/盲道/灯具与另两台共用 ReferenceStation。
+local function buildUpPlatform(root,st,pause)
+    local first,last=Route.PlatformStart,Route.PlatformEnd
+    local middle,span=(first+last)/2,last-first
+    local angle=math.rad(select(3,Route.Sample(st.s)))
+    local base=batch(root,"UpPlatformConcrete",World.Concrete(),false,3)
+    base:AddBox(Route.SampleOffset(st.s+middle,10.4,(PLATFORM_Y-.02)/2),
+        Vector3(7,PLATFORM_Y+.02,span),angle)
+    base:Finish()
+    base.geometry.viewMask=2
+    if pause then pause() end
+end
+
+function Station.Init()
+    Station.Shutdown()
+    placementData_, themeLogged_, lampOwners_ = {}, {}, {}
+end
 
 ---@param root Node
 ---@param st table
 ---@param pause fun()|nil
 function Station.BuildOne(root, st, pause)
-        local node = root:CreateChild("Station_" .. st.name)
-        local _, _, yaw = Route.Sample(st.s)
-        local angle = math.rad(yaw)
-        -- 暖灰混凝土降低重复频率；明确过滤模式，不只设置未启用的各向异性数值。
-        local concreteTexture = cache:GetResource("Texture2D", "Textures/Railway/concrete.png")
-        if concreteTexture then
-            concreteTexture:SetFilterMode(FILTER_ANISOTROPIC)
-            concreteTexture:SetAnisotropy(4)
-        end
-        local platformMat = World.Textured("StationConcreteWarm", "Textures/Railway/concrete.png", Color(.64,.65,.61), .97)
-        local copingMat = solid(Color(.68,.68,.62), 0, .96)
-        local platform = batch(node, "WeatheredConcretePlatforms", platformMat, false, 3.0)
-        local coping = batch(node, "StoneCoping", copingMat, false)
-        local safety = batch(node, "SafetyLines", solid(Color(0.76, 0.63, 0.21), 0, 0.96), false)
-        local plan=theme(st)
-        local roofMat = solid(plan.roof, .04, .90)
-        local roof = batch(node, "CityProfileCanopies", roofMat, true)
-        local frame = batch(node, "CityCanopyStructure", solid(plan.steel, .08, .86), true)
+    local node = root:CreateChild("Station_" .. st.name)
+    local _, _, yaw = Route.Sample(st.s)
+    local angle = math.rad(yaw)
+    -- 暖灰混凝土降低重复频率；明确过滤模式，不只设置未启用的各向异性数值。
+    local concreteTexture = cache:GetResource("Texture2D", "Textures/Railway/concrete.png")
+    if concreteTexture then
+        concreteTexture:SetFilterMode(FILTER_ANISOTROPIC)
+        concreteTexture:SetAnisotropy(4)
+    end
+    local platformMat = World.Textured("StationConcreteWarm", "Textures/Railway/concrete.png", Color(.64,.65,.61), .97)
+    local copingMat = solid(Color(.68,.68,.62), 0, .96)
+    local platform = batch(node, "WeatheredConcretePlatforms", platformMat, false, 3.0)
+    local coping = batch(node, "StoneCoping", copingMat, false)
+    local plan=theme(st)
         local first, last = Route.PlatformStart, Route.PlatformEnd
         local middle, span = (first + last) / 2, last - first
         for side = -1, 1, 2 do
             platform:AddBox(point(st, middle, side * (INNER + WIDTH / 2), (PLATFORM_Y - 0.02) / 2),
                 Vector3(WIDTH, PLATFORM_Y + 0.02, span), angle)
-            coping:AddBox(point(st, middle, side * (INNER + 0.19), PLATFORM_Y + 0.025),
-                Vector3(0.38, 0.05, span), angle)
-            safety:AddBox(point(st, middle, side * (INNER + 0.80), PLATFORM_Y + 0.053),
-                Vector3(0.16, 0.016, span), angle)
+            -- Recessed substrate; Reference's segmented coping top is at +.050,
+            -- so the old continuous cap cannot z-fight with the new cut-stone joints.
+            coping:AddBox(point(st, middle, side * (INNER + 0.19), PLATFORM_Y + 0.013),
+                Vector3(0.38, 0.026, span), angle)
             if pause then pause() end
         end
-        buildCityCanopies(node,st,roof,frame,pause)
-        for _, item in ipairs({platform,coping,safety,roof,frame}) do item:Finish(); if pause then pause() end end
+        ReferenceStation.BuildCanopies(node,st,pause)
+        buildUpPlatform(node,st,pause)
+        for _, item in ipairs({platform,coping}) do item:Finish(); if pause then pause() end end
+        -- 参考图中的高架枢纽补齐站台下部结构：连续板、边梁、栏杆和规律桥墩。
+        if ELEVATED_PLATFORM_INDICES[st.index] then
+            local deck=batch(node,"ElevatedStationDeck",World.Concrete(),true,4)
+            local edge=batch(node,"ElevatedStationEdgeGirders",solid(Color(.48,.51,.52),.15,.78),true)
+            local guard=batch(node,"ElevatedStationPlatformGuard",solid(Color(.56,.60,.62),.72,.48),true)
+            local pier=batch(node,"ElevatedStationPiers",World.Concrete(),true,2)
+            deck:AddBox(Route.SampleOffset(st.s+middle,-5.4,(ELEVATED_DECK_TOP+ELEVATED_DECK_BOTTOM)/2),
+                Vector3(7.0,ELEVATED_DECK_TOP-ELEVATED_DECK_BOTTOM,span),angle)
+            deck:AddBox(Route.SampleOffset(st.s+middle,10.4,(ELEVATED_DECK_TOP+ELEVATED_DECK_BOTTOM)/2),
+                Vector3(7.0,ELEVATED_DECK_TOP-ELEVATED_DECK_BOTTOM,span),angle)
+            for _,lateral in ipairs({-8.55,-2.25,7.25,13.55}) do
+                edge:AddBox(Route.SampleOffset(st.s+middle,lateral,ELEVATED_DECK_BOTTOM-.34),
+                    Vector3(.48,.68,span),angle)
+            end
+            -- The island has two boarding edges; never put an opaque guard on lane2.
+            -- Open outer-edge railings are generated once by ReferenceStation.
+            for ds=first+10,last-1,ELEVATED_PIER_STEP do
+                local pierCenter=Route.SampleOffset(st.s+ds,-5.4,(ELEVATED_PIER_BOTTOM+ELEVATED_DECK_BOTTOM)/2)
+                pier:AddBox(pierCenter,Vector3(1.35,ELEVATED_DECK_BOTTOM-ELEVATED_PIER_BOTTOM,1.35),angle)
+                if pause then pause() end
+            end
+            deck:Finish();edge:Finish();guard:Finish();pier:Finish()
+            deck.geometry.viewMask,edge.geometry.viewMask,guard.geometry.viewMask,pier.geometry.viewMask=2,2,2,2
+        end
         -- 相机遮挡专用位4只给实体站台/棚结构，家具/牌面继续使用环境位2。
-        platform.geometry.viewMask = 6
-        roof.geometry.viewMask = 6
-        frame.geometry.viewMask = 6
-        frame.geometry.shadowDistance = 100
+        platform.geometry.viewMask = 2
         Station.BuildPlatformSigns(node, st); if pause then pause() end
         Station.BuildBuilding(node, st, nil, nil, nil, pause); if pause then pause() end
         Station.BuildForecourt(node, st, pause); if pause then pause() end
         Station.BuildPlatformDetails(node, st, pause); if pause then pause() end
         Station.BuildProps(node, st, nil, PLATFORM_Y); if pause then pause() end
         if not themeLogged_[st.index] then
-            local shelterLength=0
-            for _,r in ipairs(plan.ranges) do shelterLength=shelterLength+r.last-r.first end
-            print(string.format("[Station] %s：%s，棚面总长%.0f米/柱距%.0f米/每侧长椅%d/花池%d；站台%.0f米，负台-19.90..-12.90、正岛台1.90..8.90/台面1.44米，负台棚/柱/家具整体移-11，不跨三条运营线",
-                st.name,plan.name,shelterLength,plan.supportStep,#plan.benches,#plan.planters,span))
+            local reference=ReferenceStation.GetPlan(st)
+            print(string.format("[Station] %s：%s站房身份/广场保留；参考灰色连续桁架棚%.0f米×3 / 柱距≤12米 / 灯距≤18米；站台%.0f米，负外台-19.90..-12.90、岛台-8.90..-1.90、上行外台6.90..13.90/台面1.44米",
+                st.name,plan.name,reference.roofLast-reference.roofFirst,span))
             themeLogged_[st.index]=true
         end
 end
@@ -411,27 +574,59 @@ end
 
 function Station.BuildPlatformSigns(root, st)
     local plan=theme(st)
+    local info=Station.GetSignInfo(st)
     local steel = batch(root, "SignPosts", solid(plan.steel, 0.30, 0.78), true)
-    local boards = batch(root, "CityNameBoards", solid(plan.board, 0.08, 0.83), false)
+    -- 深墨底/暖白字/琥珀边统一全线；无光照牌面=低成本背光箱，夜间不依赖逐牌点光。
+    local boards = batch(root, "CityNameBoards", signMaterial("ink",Color(.018,.040,.065)), false)
+    local accents = batch(root, "StationSignAccents", signMaterial("amber",Color(.92,.64,.18)), false)
     local _, _, yaw = Route.Sample(st.s)
     local angle=math.rad(yaw)
     for side = -1, 1, 2 do
-        for _, ds in ipairs({ -175, -60, 65 }) do
+        local platform=side<0 and info.platform1 or info.platform2
+        -- 中部取各城柱跨中点，背面看时雨棚柱不能切断字形。
+        for _, ds in ipairs({ -175, info.centerAlong, 65 }) do
             local position = point(st, ds, side * 7.2, PLATFORM_Y)
             if st.index==1 or st.index==3 then
-                -- 老站双柱站牌；新站单杆宽牌，轮廓一眼可辨。
-                for _,dz in ipairs({-plan.boardWidth*.40,plan.boardWidth*.40}) do
-                    steel:AddBox(position+Vector3(0,1.24,0)+Route.TangentAt(st.s)*dz,Vector3(.07,2.48,.07),angle)
+                for _,dz in ipairs({-info.boardWidth*.40,info.boardWidth*.40}) do
+                    steel:AddBox(position+Vector3(0,.90,0)+Route.TangentAt(st.s)*dz,Vector3(.07,1.80,.07),angle)
                 end
             else
-                steel:AddBox(position+Vector3(0,1.24,0),Vector3(.09,2.48,.09),angle)
+                steel:AddBox(position+Vector3(0,.90,0),Vector3(.09,1.80,.09),angle)
             end
-            boards:AddBox(position+Vector3(0,2.55,0),Vector3(.10,plan.boardHeight,plan.boardWidth),angle)
-            boardSigns(root,st,ds,side*7.2,PLATFORM_Y+2.69,.05,st.name,.28,"StationName")
-            boardSigns(root,st,ds,side*7.2,PLATFORM_Y+2.35,.05,plan.cityLine,.105,"CityThemeLine")
+            boards:AddBox(position+Vector3(0,2.66,0),Vector3(.10,info.boardHeight,info.boardWidth),angle)
+            accents:AddBox(position+Vector3(0,3.50,0),Vector3(.115,.055,info.boardWidth),angle)
+            boardSigns(root,st,ds,side*7.2,PLATFORM_Y+2.74,.05,info.name,info.nameSize,"StationName")
+            boardSigns(root,st,ds,side*7.2,PLATFORM_Y+3.37,.05,platform,.20,"StationPlatformNumber")
+            -- 可读正面局部-X朝向随face翻转：从-X看文字右方向=-里程，背面=+里程。
+            boardSigns(root,st,ds,side*7.2,PLATFORM_Y+2.12,.05,function(face)
+                if face<0 then return "← "..info.nextLabel.."     "..info.previousLabel.." →" end
+                return "← "..info.previousLabel.."     "..info.nextLabel.." →"
+            end,.22,"StationNeighbourDirection")
         end
+        -- 外侧月台原来离驾驶股道过远，侧面牌又接近侧视；入口识别牌正对两方向来车。
+        -- 5.4m宽完全落于7m月台内：正台[2.75,8.15]、负台[-19.15,-13.75]。
+        -- 牌底距台面2.27m，步行通道与灯棚不受阻，不增刚体。
+        local ds=Route.PlatformStart+12
+        boards:AddBox(point(st,ds,side*5.45,PLATFORM_Y+2.97),Vector3(5.4,1.4,.12),angle)
+        accents:AddBox(point(st,ds,side*5.45,PLATFORM_Y+3.65),Vector3(5.4,.05,.135),angle)
+        for _,lat in ipairs({3.05,7.85}) do
+            steel:AddBox(point(st,ds,side*lat,PLATFORM_Y+1.80),Vector3(.07,3.60,.07),angle)
+        end
+        approachSigns(root,st,ds,side*5.45,PLATFORM_Y+3.18,info.name,info.approachNameSize,"ApproachStationName")
+        approachSigns(root,st,ds,side*5.45,PLATFORM_Y+2.55,platform.." · 到站慢行",.26,"ApproachPlatformNumber")
     end
-    steel:Finish(); boards:Finish()
+    -- 停车目标以生产st.s为准（不是平台末端），黄黑牌区别于红色信号。
+    boards:AddBox(point(st,0,4.15,PLATFORM_Y+1.70),Vector3(1.24,1.45,.12),angle)
+    accents:AddBox(point(st,0,4.15,PLATFORM_Y+2.40),Vector3(1.24,.05,.14),angle)
+    steel:AddBox(point(st,0,4.15,PLATFORM_Y+.60),Vector3(.07,1.20,.07),angle)
+    approachSigns(root,st,0,4.15,PLATFORM_Y+1.94,"停",.64,"StationStopTarget")
+    approachSigns(root,st,0,4.15,PLATFORM_Y+1.35,"对标停车",.21,"StationStopInstruction")
+    steel:Finish(); boards:Finish(); accents:Finish()
+    steel.geometry.shadowDistance=70
+    steel.geometry.drawDistance=220
+    boards.geometry.drawDistance=260
+    accents.geometry.drawDistance=220
+    print(string.format("[StationSigns] %s：6块双面邻站/台号牌+2块固定朝向进站牌，背面箭头镜像布局；停车对标s=%.1f，无新增逐牌灯",st.name,st.s))
 end
 
 -- 每座城市使用各自的原型站房（红墙大屋顶/钟楼/拱门/多层/玻璃枢纽），
@@ -452,19 +647,44 @@ function Station.BuildBuilding(root, st, matBrick, matCream, matGlass, pause)
     StationBuildings.Build(node, style, pause)
     for _, child in ipairs(node:GetChildrenWithComponent("CustomGeometry",true)) do
         local structure=child:GetComponent("CustomGeometry")
-        if structure then structure.viewMask=6 end
+        if structure then structure.viewMask=2 end
     end
     local sign = node:CreateChild("HouseName")
-    -- 站名置于门廊/拱廊最外侧，避免被新增廊柱和钟楼/玻璃前厅遮挡。
-    sign.position = StationBuildings.GetSignPosition(style)
+    -- 站名置于门廊/拱廊最外侧，固定到建筑立面；深色背板隔离玻璃/墙体纹理。
+    local signPosition=StationBuildings.GetSignPosition(style)
+    local plaque=batch(node,"HouseNameBacking",signMaterial("ink",Color(.018,.040,.065)),false)
+    plaque:AddBox(signPosition-Vector3(.055,0,0),Vector3(.08,1.55,6.0))
+    plaque:Finish()
+    plaque.geometry.drawDistance=260
+    sign.position = signPosition+Vector3(.025,0,0)
     sign.rotation = Quaternion(-90, Vector3.UP)
-    Station.MakeWorldSign(sign, st.name, 0.64)
+    Station.MakeWorldSign(sign, st.name, .96)
     placementData_[#placementData_ + 1] = {
-        name = st.name, index = st.index, x = center.x, z = center.z, radius = radius, clearance = clearance,
+        name = st.name, index = st.index, x = center.x, y = center.y, z = center.z, radius = radius, clearance = clearance,
+        worldBaseY = Route.Sample(st.s).y, platformWorldY = Route.Sample(st.s).y + PLATFORM_Y,
         s = st.s, platformStart = st.s + Route.PlatformStart, platformEnd = st.s + Route.PlatformEnd,
     }
     print(string.format("[Station] %s 站房原型=%s，完整包络净空 %.2f 米（要求至少 25 米）",
         st.name, style.archetype, clearance))
+    -- Near-line waiting wings, NOT relocation/scaling of the landmark house.
+    -- x=-34 +/-4.6; complete 12.3m roof envelope is checked per module against the route.
+    -- ds[-96,-18] remains open for the main house sightline, -49 stairs and -37 ramp;
+    -- ds>=57 stays open for the existing bridge/ground approach at x=-44.
+    local wingRadius=math.sqrt(4.6^2+6.15^2)+.05
+    local wings=root:CreateChild("StationNearLineWaitingWings")
+    for _,ds in ipairs({-126,-114,-102,-12,0,12}) do
+        local wingCenter=Route.SampleOffset(st.s+ds,-34,0)
+        if Route.CanPlaceFootprint(wingCenter,wingRadius,Route.BuildingClearance) then
+            local wing=wings:CreateChild("WaitingWing_"..ds)
+            wing.position=wingCenter
+            local _,_,wingYaw=Route.Sample(st.s+ds)
+            wing.rotation=Quaternion(wingYaw,Vector3.UP)
+            StationBuildings.BuildPlatformWing(wing,style,pause)
+        else
+            print(string.format("[Station] %s 近线翼廊 ds=%.0f 未通过全线路净空，跳过而不侵入轨道",st.name,ds))
+        end
+        if pause then pause() end
+    end
 end
 
 -- 候车家具密度随城市改变，原有板条长椅和矩形灯具继续合批。
@@ -473,7 +693,7 @@ function Station.BuildProps(root, st, _matLamp, _baseY)
     local plan=theme(st)
     local steel = batch(root, "FurnitureFrames", solid(plan.steel, .30, .78), true)
     local slats = batch(root, "BenchSlats", solid(st.index<=3 and Color(.42,.35,.27) or Color(.47,.51,.51), .12, .82), true)
-    local diffuser = batch(root, "LampDiffusers", solid(Color(.73,.72,.64), 0, .75), false)
+    local diffuser = batch(root, "LampDiffusers", lampMaterial(), false)
     local _, _, yaw = Route.Sample(st.s)
     local angle = math.rad(yaw)
     for side = -1, 1, 2 do
@@ -498,12 +718,11 @@ function Station.BuildProps(root, st, _matLamp, _baseY)
                 end
             end
         end
-        for _,ds in ipairs(plan.lamps) do
-            local lampY=roofHeight(plan.profile,5.7)-.30
-            steel:AddBox(point(st,ds,side*5.7,lampY),Vector3(.16,.05,1.2),angle)
-            diffuser:AddBox(point(st,ds,side*5.7,lampY-.032),Vector3(.125,.014,1.12),angle)
-        end
     end
+    -- ReferenceStation owns all three platform lamp rows and the bounded NightLighting sites.
+    -- Keep only the city-specific benches here; no duplicate old diffuser or pole geometry.
+    lampOwners_[st.index] = true
+    ReferenceStation.BuildLightingAndRailings(root,st)
     steel:Finish(); slats:Finish(); diffuser:Finish()
     slats.geometry.shadowDistance = 90
     diffuser.geometry.drawDistance = 180
@@ -524,7 +743,10 @@ function Station.BuildForecourt(root, st, pause)
     ---@param y number
     ---@param z number
     ---@return Vector3
-    local function p(x, y, z) return origin + right * x + tangent * z + Vector3(0, y, 0) end
+    local function p(x, y, z)
+        -- 广场/台阶/树池与对应站台同一采样基高，不把3D tangent.y再次当作竖直偏移。
+        return Route.SampleOffset(st.s + z, x, y)
+    end
     local paving = batch(root, "ForecourtPaving", World.Textured("StationForecourt_"..st.index, plan.pavingTexture, plan.paving, .98), false, st.index==1 and 1.5 or 3.0)
     local joints = batch(root, "ForecourtJoints", solid(Color(.44,.45,.41),0,.98), false)
     local curb = batch(root, "ForecourtStepsKerbs", solid(Color(.58,.60,.54),0,.97), true)
@@ -686,78 +908,15 @@ function Station.BuildForecourt(root, st, pause)
     local entranceBoard = batch(root, "ForecourtEntranceBoard", solid(plan.board,.08,.83), false)
     entranceBoard:AddBox(p(-54,2.5,-49),Vector3(.08,.65,5.6),angle)
     entranceBoard:Finish()
-    boardSigns(root, st, -49, -54, 2.5, .04, "进站口  →  1站台 · "..plan.exitLabel, .19, "ForecourtEntranceSign")
+    boardSigns(root, st, -49, -54, 2.5, .04, "进站口 · 1站台 · "..plan.exitLabel, .19, "ForecourtEntranceSign")
     print(string.format("[Station] %s 广场%d格/拒绝%d格，站房至月台已接通；8级台阶及1:12外侧坡道，不跨铁路",st.name,accepted,rejected))
 end
 
--- 月台细节仍按材质合批：铺装缝、盲道条纹、排水篦子、台号及候车/出口提示。
--- 家具横距>=5米；安全线/盲道仍为表面细节，不侵入现代车体最小0.21米间隙。
+-- Actual grey paving, twin-edge tactile on island and suspended blue/clock/LED signs.
+-- The historical sign/forecourt coordinates remain intact; Reference uses explicit real laterals.
 function Station.BuildPlatformDetails(root, st, pause)
-    local _,_,yaw=Route.Sample(st.s)
-    local angle=math.rad(yaw)
-    local plan=theme(st)
-    local first,last=Route.PlatformStart,Route.PlatformEnd
-    local middle,span=(first+last)/2,last-first
-    local seams=batch(root,"PlatformPavingJoints",solid(Color(.48,.49,.46),0,.97),false)
-    local tactile=batch(root,"TactileGuidanceTiles",solid(Color(.69,.61,.36),0,.95),false)
-    local ribs=batch(root,"TactileRibs",solid(Color(.58,.51,.29),0,.95),false)
-    local dark=batch(root,"DrainGratesBinOpenings",solid(Color(.23,.27,.27),.35,.73),false)
-    local steel=batch(root,"BinsAndSuspendedFrames",solid(Color(.43,.47,.46),.65,.55),true)
-    local blue=batch(root,"PlatformInformationBoards",solid(plan.board,.08,.83),false)
-    for side=-1,1,2 do
-        -- 微薄铺装缝抬离基面1厘米，避免原底面恰贴台面的深度闪烁。
-        for ds=Route.PlatformStart+2,Route.PlatformEnd-1,3 do
-            seams:AddBox(point(st,ds,side*((INNER+OUTER)/2),PLATFORM_Y+.013),Vector3(WIDTH-.55,.006,.018),angle)
-            if pause then pause() end
-        end
-        for _,lat in ipairs({4.20,6.15,OUTER-.60}) do
-            seams:AddBox(point(st,middle,side*lat,PLATFORM_Y+.013),Vector3(.018,.006,span),angle)
-        end
-        -- 导盲带与安全线之间保留通道，家具不动；条纹离带面留1厘米。
-        tactile:AddBox(point(st,middle,side*3.15,PLATFORM_Y+.019),Vector3(.36,.018,span-2),angle)
-        for _,lat in ipairs({3.04,3.15,3.26}) do
-            ribs:AddBox(point(st,middle,side*lat,PLATFORM_Y+.041),Vector3(.026,.006,span-2),angle)
-        end
-        if side==-1 then
-            local lateralCenter = -(OUTER+2.97)/2
-            local guidanceWidth = OUTER-2.97
-            tactile:AddBox(point(st,-49,lateralCenter,PLATFORM_Y+.020),Vector3(guidanceWidth,.020,.36),angle)
-            for _,ds in ipairs({-49.11,-49,-48.89}) do
-                ribs:AddBox(point(st,ds,lateralCenter,PLATFORM_Y+.043),Vector3(guidanceWidth,.006,.025),angle)
-            end
-        end
-        for ds=-215,75,10 do
-            dark:AddBox(point(st,ds,side*8.45,PLATFORM_Y+.014),Vector3(.32,.008,.72),angle)
-            for offset=-.28,.28,.14 do
-                steel:AddBox(point(st,ds+offset,side*8.45,PLATFORM_Y+.031),Vector3(.32,.006,.025),angle)
-            end
-        end
-        for _,ds in ipairs(plan.bins) do
-            steel:AddBox(point(st,ds,side*6.75,PLATFORM_Y+.48),Vector3(.52,.96,.72),angle)
-            dark:AddBox(point(st,ds,side*6.47,PLATFORM_Y+.73),Vector3(.015,.20,.48),angle)
-            steel:AddBox(point(st,ds,side*6.75,PLATFORM_Y+.99),Vector3(.60,.055,.78),angle)
-        end
-        for i=1,2 do
-            local range=plan.ranges[i==1 and 1 or #plan.ranges]
-            local target=i==1 and -104 or -20
-            local ds=math.max(range.first+5,math.min(range.last-5,target))
-            -- 两个挂点适配实际棚底高度，岚港分段棚的挂点不落在四米开口。
-            local top=roofHeight(plan.profile,5.45)-.20
-            local boardY=top-.83
-            blue:AddBox(point(st,ds,side*5.45,boardY),Vector3(.08,.88,4.9),angle)
-            for _,dz in ipairs({-1.95,1.95}) do
-                steel:AddBox(point(st,ds+dz,side*5.45,(boardY+.44+top)/2),Vector3(.035,top-boardY-.44,.035),angle)
-            end
-            boardSigns(root, st, ds, side * 5.45, boardY, .04,
-                (side < 0 and "1" or "2") .. " 站台   黄线内候车", .24, "PlatformNumberAndWaiting")
-        end
-        local ds=side<0 and -49 or 52
-        blue:AddBox(point(st,ds,side*7.10,PLATFORM_Y+2.70),Vector3(.07,.52,4.6),angle)
-        steel:AddBox(point(st,ds,side*7.10,PLATFORM_Y+1.27),Vector3(.06,2.54,.06),angle)
-        boardSigns(root, st, ds, side * 7.10, PLATFORM_Y + 2.70, .035,
-            side < 0 and "出口  ←  "..plan.exitLabel or "出口  →  沿台端部", .18, "PlatformExitDirection")
-    end
-    for _, item in ipairs({seams,tactile,ribs,dark,steel,blue}) do item:Finish(); if pause then pause() end end
+    ReferenceStation.BuildPaving(root,st,pause)
+    ReferenceStation.BuildWayfinding(root,st,Station.MakeWorldSign,pause)
 end
 
 ---@param parent Node
@@ -771,7 +930,8 @@ function Station.MakeWorldSign(parent, text, size)
     label.viewMask = 2
     label.faceCameraMode = FC_NONE
     label.castShadows = false
-    label.drawDistance = 160
+    label.drawDistance = 220
+    label.fixedScreenSize = false
     if not label:SetFont("Fonts/MiSans-Bold.ttf", 48) then
         print("[Station] 警告：站名牌字体不可用")
     end
@@ -789,8 +949,15 @@ function Station.Forget(index)
     for i=#placementData_,1,-1 do
         if placementData_[i].index==index then table.remove(placementData_,i) end
     end
+    ReferenceStation.Forget(index)
+    NightLighting.Forget("station:" .. index)
+    lampOwners_[index] = nil
 end
-function Station.Shutdown() placementData_ = {}; themeLogged_ = {} end
+function Station.Shutdown()
+    for index in pairs(lampOwners_) do NightLighting.Forget("station:" .. index) end
+    ReferenceStation.Shutdown()
+    placementData_, themeLogged_, lampOwners_ = {}, {}, {}
+end
 function Station.GetPlacementData() return placementData_ end
 function Station.GetDimensions()
     return {
@@ -798,22 +965,39 @@ function Station.GetDimensions()
         trainWidth = 3.1, maxTrainWidth = MAX_TRAIN_WIDTH,
         sideGap = INNER - MAX_TRAIN_WIDTH / 2, classicSideGap = INNER - 3.1 / 2,
         canopyInner = CANOPY_INNER, canopyOuter = CANOPY_OUTER,
-        canopyTopY = CANOPY_Y + 0.06, columnInner = 7.57,
+        canopyTopY = 8.20, columnInner = 7.47,
+        referenceCanopy = true, referenceRoofFirst = Route.PlatformStart+6,
+        referenceRoofLast = math.min(Route.PlatformEnd-28,57),
+        referencePlatformCenters = {-16.4,-5.4,10.4},
+        referenceColumnCenters = {-18.65,-7.65,12.65},
+        referenceColumnWidth = StationVisualConfig.ReferenceArchitecture.columnWidth,
+        referenceColumnDepth = StationVisualConfig.ReferenceArchitecture.columnDepth,
+        referenceTrussBottomY = StationVisualConfig.ReferenceArchitecture.trussBottomY,
+        referenceLampSpacing = 18, referenceLampY = 6.27,
         platformStart = Route.PlatformStart, platformEnd = Route.PlatformEnd,
         buildingClearance = Route.BuildingClearance,
         negativePlatformShift = NEGATIVE_PLATFORM_SHIFT,
         negativePlatformMin = NEGATIVE_OUTER, negativePlatformMax = NEGATIVE_INNER,
-        positivePlatformMin = INNER, positivePlatformMax = OUTER,
+        -- positive为历史API名称，真实岛台现在位于负横距；消费者不得假定符号。
+        positivePlatformMin = -OUTER, positivePlatformMax = -INNER,
+        islandPlatformMin = -OUTER, islandPlatformMax = -INNER,
+        upPlatformMin = 6.9, upPlatformMax = 13.9,
+        islandStairLateral = -5.4, upStairLateral = 10.4,
         negativeCanopyMin = -CANOPY_OUTER+NEGATIVE_PLATFORM_SHIFT,
         negativeCanopyMax = -CANOPY_INNER+NEGATIVE_PLATFORM_SHIFT,
-        negativeColumnMin = -7.73+NEGATIVE_PLATFORM_SHIFT,
-        negativeColumnMax = -7.57+NEGATIVE_PLATFORM_SHIFT,
-        upLaneLateral = -5, stationLaneLateral = 10.8,
-        negativePlatformToUpBody = (-5-MAX_TRAIN_WIDTH/2)-NEGATIVE_INNER,
-        islandToSidingBody = 10.8-MAX_TRAIN_WIDTH/2-OUTER,
+        negativeColumnMin = -7.65-StationVisualConfig.ReferenceArchitecture.columnWidth/2+NEGATIVE_PLATFORM_SHIFT,
+        negativeColumnMax = -7.65+StationVisualConfig.ReferenceArchitecture.columnWidth/2+NEGATIVE_PLATFORM_SHIFT,
+        upLaneLateral = 5, stationLaneLateral = -10.8,
+        negativePlatformToUpBody = (-10.8-MAX_TRAIN_WIDTH/2)-NEGATIVE_INNER,
+        islandToSidingBody = -OUTER-(-10.8+MAX_TRAIN_WIDTH/2),
         forecourtStairMin = NEGATIVE_OUTER-3, forecourtStairMax = NEGATIVE_OUTER,
         forecourtRampMin = NEGATIVE_OUTER-16.68, forecourtRampMax = NEGATIVE_OUTER,
         forecourtGuidanceMax = NEGATIVE_OUTER,
+        elevatedPlatformStations = {1,5},
+        elevatedSupportDeckTopY = ELEVATED_DECK_TOP,
+        elevatedSupportDeckBottomY = ELEVATED_DECK_BOTTOM,
+        elevatedSupportPierStep = ELEVATED_PIER_STEP,
+        elevatedSupportDescription = "站台板下连续箱板、边梁、外缘栏杆与规律桥墩",
     }
 end
 return Station

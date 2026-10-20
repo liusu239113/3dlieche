@@ -1,14 +1,16 @@
 -- 开放长线路的地理分区，不循环轮播主题；基于3D场景脚手架，入口独占光照/Zone。
 -- 净空示意（XZ整包络，地面铺装不是障碍物）：
--- 股道1=-5 | 股道0=0 | 平台1.9..8.9 | 站侧线2=+10.8（站s-700..+400）
+-- 站侧线2=-10.8 | 岛台-8.9..-1.9 | 股道0=0 | 股道1=+5 | 上行台6.9..13.9
 -- 景观外包圆到主线>=30m，故到任一上述股道>=19.2m（超过要求的16m）。
 -- 站场硬地低于道床/月台；普通景观守包络，铁路桥隧交由Landmarks按真实沿线净空实现。
 -- 保留区由全线解析投影和规划计算，不依赖流式加载/卸载顺序。
 local Route = require "world.Route"
 local World = require "world.WorldMaterials"
 local Vegetation = require "world.Vegetation"
+local Planting = require "world.CorridorPlanting"
 local Landmarks = require "world.Landmarks"
 local GameConfig = require "config.GameConfig"
+local Mountain = require "world.MountainProfile"
 local Landscape = {}
 Landscape.TransitionLength = 1000
 Landscape.ThemeLength = Landscape.TransitionLength -- 兼容旧字段：现在是过渡宽度，绝不是主题周期。
@@ -109,8 +111,9 @@ local definitions_ = {
     },
 }
 local themeNames_ = {urban="城市铁路走廊",village="乡村丘陵",forest="远侧林丘",fields="连续农田灌渠村",industry="工业仓储",water="江岸公路桥区"}
-local styleNames_ = {"星汐：红砖老城、玻璃高楼与阶梯出城带", "岚港：青灰港务楼、长仓库与装卸街网", "榆岑：绿谷村落、低密山城街网", "镜澜：滨水白墙、青蓝商务天际线", "云湾：高密街区、百米高层与梯级入城带"}
-local displayNames_ = {"星汐总站","岚港站","榆岑站","镜澜站","云湾总站"}
+local styleNames_ = {"星汐：红砖老城、玻璃高楼与阶梯出城带", "岚港：青灰港务楼、长仓库与装卸街网", "榆岑：绿谷村落、低密山城街网", "镜澜：滨水白墙、青蓝商务天际线", "云湾：高密街区、百米高层与梯级入城带",
+    "翠川：山麓田园与低层青瓦街坊","石门：灰石镇屋与岩岭门户","云脊：林业山城与木色坡顶","松岚：高地民居与观景街网","天池：湖盆终点城与临水客运枢纽"}
+local displayNames_ = {"星汐总站","岚港站","榆岑站","镜澜站","云湾总站","翠川站","石门站","云脊站","松岚站","天池总站"}
 local regionDefinitions_ = {
     {name="星汐城区铁路走廊",theme="urban",stationIndex=1,ground=Color(.35,.43,.34)},
     {name="翠川连续农田灌渠村",theme="fields",stationIndex=1,ground=Color(.35,.47,.27)},
@@ -134,15 +137,29 @@ local function makeRegions()
     local s4=stations[4] and stations[4].s or length*.735
     local s5=stations[5] and stations[5].s or length*.960
     -- 两个北方分区占完整站间，而不是五个800m小景的排列。
+    local prefixEnd=GameConfig.MountainTerrain and GameConfig.MountainTerrain.First
     local ends={s1+(s2-s1)*.30,s2-(s2-s1)*.18,s2+(s3-s2)*.45,
-        s3+(s4-s3)*.52,s4+(s5-s4)*.48,length}
+        s3+(s4-s3)*.52,s4+(s5-s4)*.48,prefixEnd or length}
     regions_={}
     local first=0
     for i,definition in ipairs(regionDefinitions_) do
         local last=math.max(first,math.min(length,ends[i]))
-        regions_[i]={index=i,first=first,last=last,name=definition.name,theme=definition.theme,
+        local mountainNames={"山麓门户与赤壁展线","青岚石门峡谷","双峡高桥与山腰回头","云脊长坡与雪线山口","高原湖盆与天路落坡","凌岳高原终点城"}
+        local allMountain=GameConfig.MountainTerrain and not prefixEnd
+        local name=allMountain and mountainNames[i] or definition.name
+        local theme=allMountain and "forest" or definition.theme
+        regions_[i]={index=i,first=first,last=last,name=name,theme=theme,
             stationIndex=definition.stationIndex,ground=definition.ground}
         first=last
+    end
+    if prefixEnd then
+        for _,definition in ipairs(GameConfig.RouteRegions or {}) do
+            assert(math.abs(definition.first-first)<.001,"[Landscape] 延伸地理区间不连续")
+            regions_[#regions_+1]={index=#regions_+1,first=first,last=definition.last,
+                name=definition.name,theme=definition.theme or "forest",stationIndex=definition.stationIndex,
+                ground=Color(.29,.43,.31)}
+            first=definition.last
+        end
     end
 end
 
@@ -190,13 +207,25 @@ function Landscape.GetGroundColor(s)
     end
     return region.ground
 end
--- 到主线30m保守覆盖两主股道和全站侧线：最差到+10.8仍19.2m。
+-- 到主线30m保守覆盖两主股道和全站侧线：最差到-10.8仍19.2m。
 -- 这比只对当前加载RailNetwork段检测可靠；邻近曲线/另一站也参与全线最近距离。
+---@type fun(pos:Vector3,radius:number,purpose:string):boolean|nil
+local corridorExclusion_ = nil
+
+--- 由世界入口注入解析走廊保留区，避免模块循环依赖及流式先后影响占位。
+---@param callback fun(pos:Vector3,radius:number,purpose:string):boolean|nil
+function Landscape.SetCorridorExclusion(callback)
+    corridorExclusion_=callback
+    if #cities_>0 then Landscape.RefreshGroundCuts() end
+end
+
 ---@param pos Vector3
 ---@param r number
 ---@param clearance? number
 function Landscape.CanPlace(pos,r,clearance)
     return Route.CanPlaceFootprint(pos,r,math.max(30,clearance or 30))
+        and not Landmarks.Reserves(pos,r)
+        and not (corridorExclusion_ and corridorExclusion_(pos,r,"legacy"))
 end
 ---@param pos Vector3
 ---@param r number
@@ -205,7 +234,10 @@ function Landscape.InStationYard(pos,r)
     for _,city in ipairs(cities_) do
         if s+r>city.station.s-760 and s-r<city.station.s+460 then
             local track=Route.Sample(s)
-            if (pos-track):Length()<105+r then return true end
+            if GameConfig.MountainTerrain then
+                local dx,dz=pos.x-track.x,pos.z-track.z
+                if dx*dx+dz*dz<(105+r)^2 then return true end
+            elseif (pos-track):Length()<105+r then return true end
         end
     end
     return false
@@ -263,6 +295,8 @@ local function feature(index)
         lateral,r=region==6 and 110+hash(index,7)*105 or 120+hash(index,7)*120,34
         active=region==6 or index%2==0
     end
+    -- 山地图乡野由连续山体承担；不把旧平原农庄/灌渠/江湾模板撒在山壁上。
+    if Mountain.IsActiveAt(s) then active=false end
     return Route.SampleOffset(clampS(s),side*lateral,0),r,theme,s,side,active
 end
 ---@param pos Vector3
@@ -294,6 +328,17 @@ function Landscape.ReservesNature(pos,r)
     end
     return false
 end
+-- 农田保留连续耕作区，同时在外缘留真正的防护林廊；不是把所有
+-- FieldAllowed(小树半径)当成已提交田面，也不是为了种树取消整个农田主题。
+---@param pos Vector3
+---@param r number
+function Landscape.InWoodlandBelt(pos,r)
+    local distance,s=Route.DistanceTo(pos)
+    if Mountain.IsActiveAt(s) then return false end
+    local theme=Landscape.ThemeAt(s)
+    local lo,hi=theme=="fields" and 390 or 335,theme=="fields" and 454 or 435
+    return (theme=="fields" or theme=="village") and distance+r>lo and distance-r<hi
+end
 ---@param pos Vector3
 ---@param r number
 function Landscape.FieldAllowed(pos,r)
@@ -301,7 +346,37 @@ function Landscape.FieldAllowed(pos,r)
     local theme=Landscape.ThemeAt(s)
     local maxDistance=theme=="village" and 310 or 820
     return distance<maxDistance and (theme=="fields" or theme=="village")
+        and not Mountain.IsActiveAt(s) and not Landscape.InWoodlandBelt(pos,r)
         and Landscape.CanPlace(pos,r,30) and not Landscape.ReservesNature(pos,r)
+end
+-- 植被专用、可诊断的解析排除。保留建筑/城市/田地/站场和桥隧原有优先权；
+-- 唯一收紧的是旧80m沿线小路的外接圆：圆会吃掉道路内侧40余米宽草带，
+-- 实际路宽7m，改用沿线矩形全冠幅测试；不更动其他调用者的保守ReservesNature。
+---@param pos Vector3
+---@param r number
+---@return string?
+function Landscape.PlantingBlockReason(pos,r)
+    if not Route.CanPlaceFootprint(pos,r,30) then return "rail" end
+    if Landmarks.Reserves(pos,r) then return "structure" end
+    if Landscape.InStationYard(pos,r) then return "yard" end
+    if Landscape.InCity(pos,r) then return "city" end
+    if corridorExclusion_ and corridorExclusion_(pos,r,"vegetation") then return "corridor" end
+    local _,s=Route.DistanceTo(pos)
+    local lateral=(pos-Route.Sample(s)):DotProduct(Route.RightAt(s))
+    local theme=Landscape.ThemeAt(s)
+    if theme=="water" and lateral+r>190 and lateral-r<510 then return "water" end
+    if (theme=="fields" or theme=="village") and math.abs(math.abs(lateral)-310)<10+r then return "canal" end
+    local base=math.floor(s/Landscape.SampleLength)
+    local reach=math.ceil((r+150)/Landscape.SampleLength)+1
+    for i=math.max(0,base-reach),math.min(math.ceil(Route.GetLength()/Landscape.SampleLength)-1,base+reach) do
+        local candidate,rr,kind,sampleS,side,active=feature(i)
+        if active and kind~="water" then
+            local dx,dz=pos.x-candidate.x,pos.z-candidate.z
+            if dx*dx+dz*dz<(rr+r+4)^2 then return "feature" end
+            if math.abs(s-sampleS)<40+r+2 and math.abs(lateral-side*82)<3.5+r+2 then return "access" end
+        end
+    end
+    return nil
 end
 
 ---@param kind string villa/residential/warehouse/courtyard/tower
@@ -404,6 +479,8 @@ function Builder:Batch(pos,key,material,shadows,tile)
     local batch=self.batches[id]
     if not batch then
         batch=World.NewBatch(self.root:CreateChild(id),material,shadows,tile)
+        batch.geometry.drawDistance=2300
+        batch.geometry.shadowDistance=160
         self.batches[id]=batch
     end
     return batch
@@ -502,6 +579,17 @@ local function building(builder,pos,plot,yaw,cityIndex,pause)
     local glass=builder:Batch(pos,"窗门",solid(Color(.18,.27,.31),.17,.32),false)
     walls.geometry.viewMask=6; trim.geometry.viewMask=6; roof.geometry.viewMask=6; glass.geometry.viewMask=6
     local doors=roof -- 门/机房/屋面共用深灰，避免每格再增一材质批。
+    -- 四面窗带有正确外法线；每扇窗为六顶点而非扁盒的36顶点。
+    local function frontWindow(x,y,z,width,height,side)
+        local a,b,c,d=p(x-width*.5,y-height*.5,z),p(x-width*.5,y+height*.5,z),
+            p(x+width*.5,y+height*.5,z),p(x+width*.5,y-height*.5,z)
+        if side<0 then glass:AddQuad(a,b,c,d) else glass:AddQuad(d,c,b,a) end
+    end
+    local function sideWindow(x,y,z,width,height,side)
+        local a,b,c,d=p(x,y-height*.5,z-width*.5),p(x,y+height*.5,z-width*.5),
+            p(x,y+height*.5,z+width*.5),p(x,y-height*.5,z+width*.5)
+        if side>0 then glass:AddQuad(a,b,c,d) else glass:AddQuad(d,c,b,a) end
+    end
     -- 院落为真实U形三翼，中间保持露天，非一个封闭大方块。
     if plot.kind=="courtyard" then
         walls:AddBox(p(0,h*.5,d*.32),Vector3(w,h,d*.36),angle)
@@ -520,15 +608,15 @@ local function building(builder,pos,plot,yaw,cityIndex,pause)
     else
         walls:AddBox(p(0,h*.5,0),Vector3(w,h,d),angle)
         trim:AddBox(p(0,.18,0),Vector3(w+.4,.36,d+.4),angle)
-        -- 高楼最多十条完整窗带：体量可到百米，不为每层重复铺满数千箱体。
-        local floors=math.max(1,math.min(plot.kind=="tower" and 10 or 12,math.floor(h/(near and 3.1 or 7.5))))
+        -- 近中层按真实3.2m层高，远层>=5.8m；窗用立面quad而非每窗36顶点箱体。
+        local floors=math.max(1,math.min(plot.kind=="tower" and 34 or 12,math.floor(h/(near and 3.2 or 5.8))))
         -- 中高楼使用窗带+竖向分缝，低楼独立窗；远轮廓降低几何数量，不每扇窗造节点。
         for floor=1,floors do
             local y=(floor-.48)*h/floors
             if plot.kind=="tower" or plot.kind=="slab" or h>22 then
                 for side=-1,1,2 do
-                    glass:AddBox(p(0,y,side*(d*.5+.025)),Vector3(w-.7,1.4,.04),angle)
-                    glass:AddBox(p(side*(w*.5+.025),y,0),Vector3(.04,1.4,d-.7),angle)
+                    frontWindow(0,y,side*(d*.5+.028),w-.7,plot.kind=="tower" and 1.9 or 1.4,side)
+                    sideWindow(side*(w*.5+.028),y,0,d-.7,plot.kind=="tower" and 1.9 or 1.4,side)
                 end
                 if floor%3==0 then trim:AddBox(p(0,floor*h/floors,0),Vector3(w+.15,.10,d+.15),angle) end
             elseif plot.kind~="warehouse" then
@@ -567,8 +655,13 @@ local function building(builder,pos,plot,yaw,cityIndex,pause)
                 -- 退台/不同高度机房改变天际线，禁止每栋相同平顶。
                 walls:AddBox(p(w*.08,h+1.5,-d*.08),Vector3(w*.58,3,d*.60),angle)
                 roof:AddBox(p(w*.08,h+3.05,-d*.08),Vector3(w*.59,.10,d*.61),angle)
-                for x=-w*.5+2,w*.5-1,5 do
-                    trim:AddBox(p(x,h*.5,-d*.5-.06),Vector3(.16,h,.15),angle)
+                for side=-1,1,2 do
+                    for x=-w*.5+2,w*.5-1,4.6 do
+                        trim:AddBox(p(x,h*.5,side*(d*.5+.065)),Vector3(.16,h,.14),angle)
+                    end
+                    for z=-d*.5+2,d*.5-1,5.4 do
+                        trim:AddBox(p(side*(w*.5+.065),h*.5,z),Vector3(.14,h,.16),angle)
+                    end
                 end
             end
         end
@@ -602,11 +695,16 @@ function Landscape.Init()
     end
     -- stationIndex固定街网/密度/体量/底色，不从周期或随机数选城市风格。
     local profiles={
-        {rows={-134,-248,-350},columns=11,spacing=94,opposite={136,282},oppColumns=7,ground=Color(.49,.47,.43)},
-        {rows={-174,-304,-445},columns=9,spacing=134,opposite={200,350},oppColumns=6,ground=Color(.38,.41,.42)},
-        {rows={-134,-310,-475},columns=7,spacing=157,opposite={136},oppColumns=5,ground=Color(.44,.47,.35)},
-        {rows={-136,-251,-370},columns=9,spacing=119,opposite={},oppColumns=0,ground=Color(.52,.52,.46)},
-        {rows={-136,-225,-308,-394},columns=15,spacing=73,opposite={138,251},oppColumns=12,ground=Color(.36,.40,.43)},
+        {rows={-134,-205,-278,-358,-450,-550},columns=17,spacing=58,opposite={174,248,335,435},oppColumns=15,ground=Color(.49,.47,.43)},
+        {rows={-174,-286,-398,-510},columns=12,spacing=94,opposite={200,310,425},oppColumns=10,ground=Color(.38,.41,.42)},
+        {rows={-134,-214,-300,-395,-495},columns=12,spacing=68,opposite={174,260},oppColumns=9,ground=Color(.44,.47,.35)},
+        {rows={-136,-211,-290,-375,-470,-570},columns=15,spacing=64,opposite={},oppColumns=0,ground=Color(.52,.52,.46)},
+        {rows={-136,-208,-282,-360,-450,-550},columns=20,spacing=56,opposite={174,250,335,435},oppColumns=17,ground=Color(.36,.40,.43)},
+        {rows={-134,-224},columns=7,spacing=86,opposite={136},oppColumns=5,ground=Color(.44,.48,.35)},
+        {rows={-140,-245},columns=7,spacing=90,opposite={140},oppColumns=5,ground=Color(.48,.47,.42)},
+        {rows={-138,-235,-330},columns=7,spacing=94,opposite={140},oppColumns=5,ground=Color(.40,.46,.37)},
+        {rows={-138,-240},columns=8,spacing=91,opposite={140},oppColumns=5,ground=Color(.45,.47,.40)},
+        {rows={-138,-240,-340},columns=9,spacing=90,opposite={140,245},oppColumns=6,ground=Color(.46,.49,.47)},
     }
     for _,station in ipairs(Route.GetStations()) do
         local origin,tangent,yaw=Route.Sample(station.s)
@@ -624,6 +722,7 @@ function Landscape.Init()
                 local w,d,h,kind,pitched,district=24.0,28.0,9.0,"villa",true,"城市住宅"
                 if index==1 then
                     if row==1 then w,d,h,kind,pitched,district=25,30,4.6+v%2,"courtyard",false,"红灰院落"
+                    elseif row==2 then w,d,h,kind,pitched,district=30,36,17+v%5*3.1,"slab",false,"连续中层街坊"
                     else w,d,h,kind,pitched,district=32,38,52+v%7*9,"tower",false,"星汐玻璃商务高楼" end
                 elseif index==2 then
                     w,d,h,kind,pitched,district=50+v%3*8,64,8+v%3*2,"warehouse",true,"长仓库与装卸院"
@@ -636,9 +735,19 @@ function Landscape.Init()
                 elseif index==4 then
                     w,d,h,kind,pitched,district=26+v%3*3,34,12+v%5*3.1,"slab",false,"滨江街坊"
                     if row==3 and col%3==0 then h,kind,district=64+v%4*10,"tower","镜澜青蓝岸外商务楼" end
-                else
+                elseif index==5 then
                     w,d,h,kind,pitched,district=27+v%3*3,36,76+((v*7)%13)*4.8,"tower",false,"云湾百米高层组团"
                     if row==1 then h,kind,district=15+v%5*3.1,"slab","近轨商业住宅" end
+                else
+                    -- 新山城以水平站坪上的低层街坊为主，不复制云湾百米高楼模板。
+                    w,d,h,kind,pitched,district=20+v%3*2,26,6+(v%3)*2.5,"villa",true,"山城坡顶民居"
+                    if index==7 then h,kind,pitched,district=10+v%3*3,"slab",false,"石门灰石街坊" end
+                    if index==8 then district="云脊林业街坊" end
+                    if index==9 then h,district=7+v%3*3,"松岚高地民居" end
+                    if index==10 then
+                        h,kind,pitched,district=16+v%4*5,"slab",false,"天池湖岸街坊"
+                        if row==3 and col%3==0 then h,kind,district=42+v%3*5,"tower","天池客运商务楼" end
+                    end
                 end
                 local plotLateral=lateral
                 -- 首排已有楼集中在站前观景范围；不增楼、不把大仓库推入保留区。
@@ -803,22 +912,29 @@ function Landscape.ClipUnclaimedGround(poly)
 end
 
 -- 站场保持轨道硬地[-22,+22]，外围为维护土面；不全幅抬高，不覆盖已有月台/路基。
+-- 站场地面改用纹理材质（混凝土/土面），消除大面积纯色平板。
 local function stationGround(builder,city,data,pause)
     local a,b=clampS(city.station.s-760),clampS(city.station.s+460)
-    local hard=solid(Color(.46,.47,.45),0,.99)
-    local earth=solid(Color(.39,.37,.30),0,.99)
+    local hard=World.UrbanGround()
+    local earth=World.Grassland()
     for first=a,b-.001,64 do
         local last=math.min(b,first+64)
         local center=Route.Sample((first+last)*.5)
         for _,band in ipairs({{lo=-100,hi=-22,hard=false},{lo=-22,hi=22,hard=true},{lo=22,hi=105,hard=false}}) do
-            local batch=builder:Batch(center,band.hard and "硬化站场" or "站场维护土",band.hard and hard or earth,false,12)
+            local batch=builder:Batch(center,band.hard and "硬化站场" or "站场维护土",band.hard and hard or earth,false,band.hard and 8 or 7)
             local poly={Route.SampleOffset(first,band.lo,0),Route.SampleOffset(last,band.lo,0),
                 Route.SampleOffset(last,band.hi,0),Route.SampleOffset(first,band.hi,0)}
-            -- 自己只铺底；站房/广场/月台小范围由Station拥有，保守挖去该入口区。
-            local forecourt={a=-120,b=10,lo=-90,hi=-19.9}
-            local pieces=subtractGround(poly,cityQuad(city,forecourt,0))
+            -- 平地入口沿用旧裁切，Y=-.25保底负责未铺砖的边角；山地没有该保底。
+            -- 山地必须保留站基Y处完整土底（Terrain已让出整段站场），否则站房两侧透天空。
+            -- Station铺砖底Y=0、顶Y=.05，地基不与可见铺砖顶面共面，也不改变轨道/月台高度。
+            ---@type Vector3[][]
+            local pieces={poly}
+            if not Mountain.IsActiveAt(city.station.s) then
+                local forecourt={a=-120,b=10,lo=-90,hi=-19.9}
+                pieces=subtractGround(poly,cityQuad(city,forecourt,0))
+            end
             for _,piece in ipairs(pieces) do
-                for i=2,#piece-1 do batch:AddTri(piece[1],piece[i],piece[i+1]) end
+                for i=2,#piece-1 do batch:AddTriPlanar(piece[1],piece[i],piece[i+1],band.hard and 8 or 7) end
             end
             if band.hard then data.yardArea=data.yardArea+(last-first)*44 end
         end
@@ -827,7 +943,7 @@ local function stationGround(builder,city,data,pause)
     -- 街块下面不再叠城市大面和门前小面，单表面分色；空地由Terrain土面显示。
     for _,zone in ipairs(city.groundZones) do
         local pos=at(city,(zone.a+zone.b)*.5,(zone.lo+zone.hi)*.5)
-        local batch=builder:Batch(pos,"城市基底",solid(city.ground,0,.99),false,16)
+        local batch=builder:Batch(pos,"城市基底",World.UrbanGround(),false,8)
         local pieces={cityQuad(city,zone,0)}
         for _,road in ipairs(city.roads) do
             local roadPos=at(city,road.along,road.lateral)
@@ -844,7 +960,7 @@ local function stationGround(builder,city,data,pause)
             end
         end
         for _,piece in ipairs(pieces) do
-            for i=2,#piece-1 do batch:AddTri(piece[1],piece[i],piece[i+1]) end
+            for i=2,#piece-1 do batch:AddTriPlanar(piece[1],piece[i],piece[i+1],8) end
         end
         data.pavedArea=data.pavedArea+(zone.b-zone.a)*(zone.hi-zone.lo)
         data.paving=data.paving+1
@@ -878,7 +994,7 @@ function Landscape.BuildCity(owner,station,pause)
     for _,road in ipairs(city.roads) do
         local pos=at(city,road.along,road.lateral)
         local r=radius(road.w,road.d)
-        if Route.CanPlaceFootprint(pos,r,30) and not Landscape.InStationYard(pos,r)
+        if Landscape.CanPlace(pos,r,30) and not Landscape.InStationYard(pos,r)
             and not overlapsPlot(city,road.along,road.lateral,road.w,road.d,2.0) then
             builder:Batch(pos,"道路",roadMaterial,false):AddBox(pos+Vector3(0,.022,0),Vector3(road.w,.044,road.d),math.rad(city.yaw))
             data.paths[#data.paths+1]={x=pos.x,z=pos.z,radius=r,stationIndex=station.index}
@@ -888,7 +1004,7 @@ function Landscape.BuildCity(owner,station,pause)
     for _,plot in ipairs(city.plots) do
         local pos=at(city,plot.along,plot.lateral)
         local r=radius(plot.width,plot.depth,3)
-        if Route.CanPlaceFootprint(pos,r,30) and not Landscape.InStationYard(pos,r) then
+        if Landscape.CanPlace(pos,r,30) and not Landscape.InStationYard(pos,r) then
             local record=building(builder,pos,plot,city.yaw,station.index,pause)
             record.x,record.z,record.stationIndex=pos.x,pos.z,station.index
             record.name=data.name.."_"..plot.district.."_"..plot.variant
@@ -904,16 +1020,17 @@ function Landscape.BuildCity(owner,station,pause)
         else data.rejected=data.rejected+1 end
         pauseOnce(pause)
     end
+    ---@type RailwayPlantBatch
     local plants=Vegetation.NewBatch(root:CreateChild("城市行道树"))
     local treeA,treeB=Vegetation.GetAsset("treeA"),Vegetation.GetAsset("treeB")
-    local parkLat=station.index==5 and -455 or (station.index==2 and -515 or (station.index==3 and -550 or -440))
+    local parkLat=(city.zones[1] and city.zones[1].lo or -550)-26
     -- 行道树固定在建筑末排之外/对侧林带，无农田水面进入保留城市。
     for i=-8,8 do
         local asset=i%3==0 and treeB or treeA
         if asset then
             local pos=at(city,i*31-45,parkLat)
             local scale,r=Vegetation.Measure(asset,7.5+(i+19)%3)
-            if Route.CanPlaceFootprint(pos,r,30) and not Landscape.InStationYard(pos,r) then
+            if Landscape.CanPlace(pos,r,30) and not Landscape.InStationYard(pos,r) then
                 plants:Add(asset,pos,scale,(i*71)%360); data.trees=data.trees+1
             end
         end
@@ -923,9 +1040,12 @@ function Landscape.BuildCity(owner,station,pause)
         for i=-7,7 do
             local asset=i%2==0 and treeB or treeA
             if asset then
-                local pos=at(city,i*34-70,station.index==3 and 365 or -505)
+                local along=i*34-70
+                local lateral=station.index==3 and 365 or parkLat-28
+                local pos=at(city,along,lateral)
                 local scale,r=Vegetation.Measure(asset,8+(i+16)%4)
-                if Route.CanPlaceFootprint(pos,r,30) and not Landscape.InStationYard(pos,r) then
+                if Landscape.CanPlace(pos,r,30) and not Landscape.InStationYard(pos,r)
+                    and not overlapsPlot(city,along,lateral,r*2,r*2,2) then
                     plants:Add(asset,pos,scale,(i*43)%360); data.trees=data.trees+1
                 end
             end
@@ -954,7 +1074,7 @@ function Landscape.BuildCity(owner,station,pause)
                 for _,side in ipairs({1,-1}) do
                     local lat=street.lateral+side*(street.width*.5+r+2)
                     local pos=at(city,along,lat)
-                    if Route.CanPlaceFootprint(pos,r,30) and not Landscape.InStationYard(pos,r)
+                    if Landscape.CanPlace(pos,r,30) and not Landscape.InStationYard(pos,r)
                         and not overlapsPlot(city,along,lat,r*2,r*2,2)
                         and not overlapsRoad(city,along,lat,r) then
                         plants:Add(asset,pos,scale,(i*71+row*43)%360)
@@ -968,14 +1088,24 @@ function Landscape.BuildCity(owner,station,pause)
             pauseOnce(pause)
         end
     end
+    local addedTrees,hedges,plantGroups,plantBatches,plantMaterials=Planting.BuildCity(root,city,function(pos,r)
+        return Landscape.CanPlace(pos,r,30) and not Landscape.InStationYard(pos,r)
+    end,function(along,lateral,r)
+        return overlapsPlot(city,along,lateral,r*2,r*2,1)
+    end,function(along,lateral,r)
+        return overlapsRoad(city,along,lateral,r)
+    end,pause)
+    data.trees=data.trees+addedTrees;data.streetTrees=data.streetTrees+addedTrees;data.hedges=hedges
     local _,treeGroups=plants:Finish()
-    for _,group in pairs(plants.groups) do group.drawDistance=700; group.castShadows=false end
+    for _,group in pairs(plants.groups) do group.drawDistance=1050; group.castShadows=false end
     local modelBatches=0
     data.meshes,data.vertices,data.materialCount,modelBatches=builder:Finish(pause)
     local modelGroups=0
     for _ in pairs(builder.models) do modelGroups=modelGroups+1 end
-    data.materialBatches=data.meshes-modelGroups+modelBatches+treeGroups*2
+    data.materialBatches=data.meshes-modelGroups+modelBatches+treeGroups*2+plantBatches
+    data.meshes=data.meshes+plantGroups+treeGroups
     data.materialKeys=builder.materialKeys
+    for material in pairs(plantMaterials) do data.materialKeys[material]=true end
     for _,group in pairs(plants.groups) do
         for slot=0,group.numGeometries-1 do data.materialKeys[tostring(group:GetMaterial(slot))]=true end
     end
@@ -1000,8 +1130,8 @@ local function strip(builder,key,material,a,b,lo,hi,y)
 end
 local function countrysideCanal(builder,a,b,theme,data)
     if theme~="fields" and theme~="village" then return end
-    local water=solid(Color(.19,.34,.34),.05,.32)
-    local bank=solid(Color(.40,.35,.27),0,.99)
+    local water=World.Water()
+    local bank=World.DryEarth()
     for side=-1,1,2 do
         local center=Route.SampleOffset((a+b)*.5,side*310,0)
         if not Landscape.InCity(center,45) and not Landscape.InStationYard(center,45) then
@@ -1020,8 +1150,8 @@ local function riverSegment(builder,a,b,data)
     local center=Route.SampleOffset(s,(ca+cb)*.5,0)
     if Landmarks.Reserves(center,112) or Landscape.InStationYard(center,105) then return end
     if not Landscape.CanPlace(center,112,30) then data.rejected=data.rejected+1; return end
-    local water=builder:Batch(center,"江湾水",solid(Color(.15,.30,.34),.10,.27),false,24)
-    local bank=builder:Batch(center,"河岸",solid(Color(.52,.49,.36),0,.99),false,16)
+    local water=builder:Batch(center,"江湾水",World.Water(),false,24)
+    local bank=builder:Batch(center,"河岸",World.DryEarth(),false,8)
     water:AddQuad(Route.SampleOffset(a,ca-76,.027),Route.SampleOffset(b,cb-76,.027),
         Route.SampleOffset(b,cb+76,.027),Route.SampleOffset(a,ca+76,.027))
     for side=-1,1,2 do
@@ -1077,6 +1207,7 @@ function Landscape.BuildChunk(owner,first,last,pause)
     local key=string.format("%.3f_%.3f",first,last)
     local root=owner:CreateChild("沿线地理")
     local builder=newBuilder(root)
+    ---@type RailwayPlantBatch
     local plants=Vegetation.NewBatch(root:CreateChild("低频植被"))
     local treeA,treeB=Vegetation.GetAsset("treeA"),Vegetation.GetAsset("treeB")
     local data={first=first,last=last,placements={},themes={},regions={},buildings=0,highRises=0,trees=0,grass=0,water=0,roads=0,canals=0,bridges=0,
@@ -1139,6 +1270,9 @@ function Landscape.BuildChunk(owner,first,last,pause)
                 local lat=theme=="village" and 58+hash(i,j)*16 or (theme=="water" and -130-hash(i,j)*55 or 52+hash(i,j)*18)
                 local treePos=Route.SampleOffset(clampS(start+10+hash(i,j+20)*60),treeSide*math.abs(lat),0)
                 if theme=="water" then treePos=Route.SampleOffset(clampS(start+20),lat,0) end
+                if GameConfig.MountainTerrain then
+                    treePos=Vector3(treePos.x,Mountain.GetGroundHeight(treePos.x,treePos.z),treePos.z)
+                end
                 local scale,rr=Vegetation.Measure(asset,7+hash(i,j+40)*3)
                 if Landscape.CanPlace(treePos,rr,30) and not Landscape.ReservesNature(treePos,rr) and not Landscape.FieldAllowed(treePos,rr+20) then
                     plants:Add(asset,treePos,scale,hash(i,j+70)*360); data.trees=data.trees+1
@@ -1179,7 +1313,10 @@ function Landscape.ForgetChunk(first,last)
     chunkData_[key]=nil
     Landmarks.ForgetBuildings("scenery_"..key)
 end
-function Landscape.Shutdown() cities_,cityData_,chunkData_,logged_,regions_,groundCuts_,industrySides_={},{},{},{},{},{},{} end
+function Landscape.Shutdown()
+    corridorExclusion_=nil
+    cities_,cityData_,chunkData_,logged_,regions_,groundCuts_,industrySides_={},{},{},{},{},{},{}
+end
 function Landscape.GetPlacementData()
     local result={}
     for _,data in pairs(cityData_) do for _,item in ipairs(data.placements) do result[#result+1]=item end end

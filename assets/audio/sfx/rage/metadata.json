@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "source": "Official text_to_music and batch_sound_effects tools; original prompts only; no user screenshots or external reference media",
+  "music": {
+    "title": "赤轨破晓 · Crimson Rail Ignition",
+    "requestedBpm": 176,
+    "generator": "text_to_music",
+    "taskId": "temp_1a7c65ab-1cb3-4c59-88dc-62323036103b",
+    "musicId": "7682915c-3c12-4889-be24-8a7aef916269",
+    "instrumental": true,
+    "style": "Original heroic anime railway adventure OP; galloping rail rhythm, electric guitar, symphonic strings/brass and electronic drums",
+    "bpmAuditionVerified": false
+  },
+  "mastering": {
+    "music": "Highpass35Hz/lowpass15500Hz, loudnorm target -16LUFS / -4dBTP, 44.1kHz stereo Vorbis, short edge fades",
+    "effects": "Highpass65Hz/lowpass9000Hz, loudnorm target -18LUFS / -6dBTP, 44.1kHz mono PCM16 WAV",
+    "notes": "Measured file decode metrics, not a listening test. Effects are official generated recordings, never hand-made noise fallback."
+  },
+  "assets": {
+    "audio/music/rage_ignition_loop.ogg": {
+      "rms": 0.1083815374546313,
+      "peak": 0.5957638621330261,
+      "rmsDb": -19.300893851243433,
+      "peakDb": -4.498516875464249,
+      "duration": 117.3,
+      "sampleRate": 44100,
+      "channels": 2,
+      "decodedSamples": 10339596
+    },
+    "audio/sfx/rage/rage_landing_scrape.wav": {
+      "rms": 0.08183817518205443,
+      "peak": 0.497314453125,
+      "rmsDb": -21.740881260697936,
+      "peakDb": -6.0673783793522045,
+      "duration": 2.424014,
+      "sampleRate": 44100,
+      "channels": 1,
+      "decodedSamples": 106899
+    },
+    "audio/sfx/rage/rage_launch_whoosh.wav": {
+      "rms": 0.07606115339416537,
+      "peak": 0.418731689453125,
+      "rmsDb": -22.376741864335813,
+      "peakDb": -7.561283412514958,
+      "duration": 1.32,
+      "sampleRate": 44100,
+      "channels": 1,
+      "decodedSamples": 58212
+    },
+    "audio/sfx/rage/rage_metal_impact_a.wav": {
+      "rms": 0.06297605805751609,
+      "peak": 0.47113037109375,
+      "rmsDb": -24.0164905441855,
+      "peakDb": -6.5371779673145545,
+      "duration": 1.631995,
+      "sampleRate": 44100,
+      "channels": 1,
+      "decodedSamples": 71971
+    },
+    "audio/sfx/rage/rage_metal_impact_b.wav": {
+      "rms": 0.07312832506708926,
+      "peak": 0.465606689453125,
+      "rmsDb": -22.718287471061338,
+      "peakDb": -6.63961577456416,
+      "duration": 1.728005,
+      "sampleRate": 44100,
+      "channels": 1,
+      "decodedSamples": 76205
+    }
+  },
+  "humanAuditionValidated": false,
+  "phoneOutputValidated": false
+}

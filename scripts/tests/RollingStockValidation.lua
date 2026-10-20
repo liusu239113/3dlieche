@@ -99,8 +99,12 @@ function Validation.CheckConnections()
         expectNear((connection.centerB-Connections.EndCenter(connection.following,front)):Length(),0,.002,"front anchor")
         local expectedA,expectedB = Connections.EndRing(connection.lead,rear),Connections.EndRing(connection.following,front)
         for k=1,4 do
-            expectNear((connection.ringA[k]-expectedA[k]):Length(),0,.002,"ringA")
-            expectNear((connection.ringB[k]-expectedB[k]):Length(),0,.002,"ringB")
+            ---@type Vector3
+            local deltaA=connection.ringA[k]-expectedA[k]
+            ---@type Vector3
+            local deltaB=connection.ringB[k]-expectedB[k]
+            expectNear(deltaA:Length(),0,.002,"ringA")
+            expectNear(deltaB:Length(),0,.002,"ringB")
         end
         assert(connection.geometry:GetNumVertices(0)==Connections.FoldSegments*4*6,"风挡折叠拓扑不完整")
         -- 每个geometry首/末环至少有一个真实上传顶点吻合，防止只更新验收记录但未更新mesh。

@@ -1,188 +1,360 @@
--- 主入口集成验收：菜单暂停、停车换车、游戏进度、声源及UI真实回调。
+-- 真实main声音恢复集成，复用EmergenceApplicationValidation的main生命周期/触摸脚手架。
+-- Save facade内存fixture，不开玩家文件，不调用云；生产格式/迁移校验由Emergence负责。
+-- 只包装Announcements.new观察main实际创建的实例，绝不直接调用Announce或代造Feedback。
+-- 列车位置/驾驶阶段通过公开RestoreState夹具注入；到站仍由main固定步->Game.CheckArrival产生。
+-- 默认CPU确定性推进提示音；-main-integration-device使用SDL disk自然混音/真实解码时钟。
+local Save=require "game.SaveStore"
+local Announcements=require "audio.Announcements"
+local Catalog=require "config.AnnouncementCatalog"
+local originals_={Load=Save.Load,Write=Save.Write,Get=Save.Get,SetCloud=Save.SetCloud,
+    ReadCloud=Save.ReadCloud,new=Announcements.new,cloud=clientCloud}
+local fixture_={version=1,settings={sound=true,music=false,volume=.75,announcementVolume=.85,
+    ambienceVolume=0,language="zh",cloud=true,quality="low",environment={hour=12,running=false,weather="clear"}},journeys={}}
+local writes_,reads_,cloudCalls_,created_=0,0,0,0
+local function copy(value) return cjson.decode(cjson.encode(value)) end
+Save.Load=function() return copy(fixture_) end
+Save.Get=function() return copy(fixture_) end
+Save.Write=function(data) writes_=writes_+1;fixture_=copy(data);return true end
+Save.SetCloud=function() end
+Save.ReadCloud=function(callback) reads_=reads_+1;callback(copy(fixture_)) end
+_G.clientCloud=setmetatable({}, {__index=function(_,key)
+    return function() cloudCalls_=cloudCalls_+1;error("禁止真实云："..tostring(key)) end
+end})
+---@type RailwayAnnouncements?
+local announcements_=nil
+Announcements.new=function(options)
+    created_=created_+1
+    local actual=originals_.new(options)
+    announcements_=actual
+    return actual
+end
 require "main"
-local startGame = Start
-local Route = require "world.Route"
-local Train = require "train.Train"
-local Hud = require "ui.Hud"
-local Station = require "world.Station"
-local TrainCamera = require "train.Camera"
-local Game = require "game.Game"
-local Audio = require "audio.AudioManager"
-local UI = require "urhox-libs/UI"
-
-local frame_ = 0
-
--- 使用真实触摸命中与浮层分发，不直接调用按钮回调代替交互。
+local mainStart,mainUpdate,mainPost,mainStop=Start,HandleUpdate,HandlePostUpdate,Stop
+local UI=require "urhox-libs/UI"
+local Hud=require "ui.Hud"
+local Menu=require "ui.Menu"
+local Train=require "train.Train"
+local Game=require "game.Game"
+local Passenger=require "game.PassengerService"
+local Route=require "world.Route"
+local Modes=require "config.GameModes"
+local Soundscape=require "audio.Soundscape"
+local PREFIX="[MainIntegration] "
+local checks_,frames_,touchId_=0,0,980
+local stopped_,done_,failed_,started_,device_=false,false,false,false,false
+local stage_,stageFrame_="loading",0
+local round_,voiceMax_,oldAccepted_=0,0.0,0
+local firstInstance_={} ---@type table
+local beforeArrival_={} ---@type table
+local savedJourney_={} ---@type table
+local reasons_={"master","announcement","language","background"}
+local function check(value,message) checks_=checks_+1;assert(value,PREFIX..message) end
+local function status() return assert(announcements_):GetStatus() end
+local function transition(name)
+    stage_,stageFrame_=name,frames_
+    print(PREFIX.."stage="..name.." round="..round_.." frame="..frames_)
+end
+local function cleanup()
+    if stopped_ then return end
+    stopped_=true
+    if started_ then
+        local ok,message=pcall(mainStop)
+        if not ok then failed_=true;log:Write(LOG_ERROR,PREFIX..tostring(message)) end
+    end
+    Save.Load,Save.Write,Save.Get=originals_.Load,originals_.Write,originals_.Get
+    Save.SetCloud,Save.ReadCloud=originals_.SetCloud,originals_.ReadCloud
+    Announcements.new=originals_.new
+    _G.clientCloud=originals_.cloud
+    print(PREFIX.."MEMORY_FIXTURE_CLEANED playerSaveIO=0 externalCloudCalls="..cloudCalls_.." writes="..writes_)
+end
+local function guard(action)
+    if done_ or failed_ then return end
+    local ok,message=xpcall(action,debug.traceback)
+    if not ok then
+        failed_=true;log:Write(LOG_ERROR,tostring(message));cleanup();engine:Exit()
+    end
+end
+---@param dt? number
+local function step(dt)
+    local event=VariantMap();event["TimeStep"]=Variant(dt or .02)
+    mainUpdate("Update",event --[[@as UpdateEventData]])
+end
+---@param root Widget
 ---@param id string
-local function tapButton(id)
+---@param scrollId? string
+local function visible(root,id,scrollId)
     UI.Layout()
-    local widget = assert(assert(Hud.GetRoot()):FindById(id), "找不到按钮：" .. id)
-    local rect = widget:GetAbsoluteLayoutForHitTest()
-    assert(rect.w > 0 and rect.h > 0, "按钮没有实际布局：" .. id)
-    local x, y = (rect.x + rect.w * 0.5) * UI.GetScale(),
-        (rect.y + rect.h * 0.5) * UI.GetScale()
-    UI.InputAdapter.HandleTouchBegin(990, x, y, 0.5)
-    UI.InputAdapter.HandleTouchEnd(990, x, y)
-end
-
-local function selectCatalogTrain(id)
-    local selector = assert(Hud.GetTrainSelector())
-    for _ = 1,selector:GetPageCount() do
-        if assert(Hud.GetRoot()):FindById("selectTrain_"..id) then
-            tapButton("selectTrain_"..id)
-            return
-        end
-        local before = selector:GetPage()
-        tapButton("nextTrainPage")
-        assert(selector:GetPage() ~= before, "下一页按钮没有推进车型页码")
+    local widget=assert(root:FindById(id),PREFIX.."缺少真实控件 "..id)
+    local scroll=root:FindById(scrollId or "menuScroll") --[[@as ScrollView?]]
+    if scroll then
+        scroll:UpdateContentSize()
+        local r,b=widget:GetAbsoluteLayoutForHitTest(),scroll:GetAbsoluteLayoutForHitTest()
+        if r.y<b.y or r.y+r.h>b.y+b.h then scroll:ScrollBy(0,r.y+r.h*.5-b.y-b.h*.5);UI.Layout() end
     end
-    error("所有车型页均没有目标车型："..id)
+    return widget
 end
-
-local function step()
-    local data = VariantMap()
-    data["TimeStep"] = Variant(0.1)
-    HandleUpdate("Update", data --[[@as UpdateEventData]])
+---@param root Widget
+---@param id string
+---@param scrollId? string
+local function tap(root,id,scrollId)
+    local widget=visible(root,id,scrollId)
+    local r=widget:GetAbsoluteLayoutForHitTest()
+    check(r.w>0 and r.h>0 and UI.FindWidgetAt(r.x+r.w*.5,r.y+r.h*.5)==widget,"触摸未命中 "..id)
+    touchId_=touchId_+1
+    local x,y=(r.x+r.w*.5)*UI.GetScale(),(r.y+r.h*.5)*UI.GetScale()
+    UI.InputAdapter.HandleTouchBegin(touchId_,x,y,.5)
+    UI.InputAdapter.HandleTouchEnd(touchId_,x,y)
+    -- 菜单按钮在生产MenuRoot:Update中提交动作；推进真实UI，而非调用按钮业务或伪造页面。
+    UI.Update(.02)
+    print(PREFIX.."REAL_TOUCH "..id)
 end
-
+---@param key string
+---@param value number
+local function volume(key,value)
+    local root=assert(Hud.GetRoot())
+    tap(root,"openVolumePanel")
+    local widget=visible(root,"volumeSlider_"..key,"volumeScroll") --[[@as Slider]]
+    local r=widget:GetAbsoluteLayoutForHitTest()
+    local x=r.x+(value==0 and 1 or r.w*.75)
+    check(UI.FindWidgetAt(x,r.y+r.h*.5)==widget,"真实音量滑杆命中失败")
+    touchId_=touchId_+1
+    UI.InputAdapter.HandleTouchBegin(touchId_,x*UI.GetScale(),(r.y+r.h*.5)*UI.GetScale(),.5)
+    UI.InputAdapter.HandleTouchEnd(touchId_,x*UI.GetScale(),(r.y+r.h*.5)*UI.GetScale())
+    check(value==0 and widget:GetValue()==0 or value>0 and widget:GetValue()>.6,"滑杆没有提交音量")
+    tap(root,"closeVolumePanel")
+    check(fixture_.settings[key]==widget:GetValue(),"main设置未由真实滑杆回调持久化")
+end
+local function begin(resume)
+    check(GetApplicationState()=="menu","开始前不是主菜单")
+    tap(assert(Menu.GetRoot()),"startGame")
+    check(Menu.GetPage()=="modes" and GetGameScene()==nil,"模式页提前创建世界")
+    tap(assert(Menu.GetRoot()),resume and "continueMode_normal" or "selectMode_normal")
+    check(GetApplicationState()=="loading","模式卡片没有启动生产加载")
+end
+local function returnMenu()
+    local root=assert(Hud.GetRoot())
+    if not Hud.GetReadings().operationsExpanded then tap(root,"toggleOperations") end
+    tap(root,"returnMainMenu","operationsDetails")
+    check(GetApplicationState()=="menu" and GetGameScene()==nil,"返回菜单未释放真实世界")
+end
+-- 从真实main当前状态导出合法恢复夹具；不调用Arrive/BeginStop或修改Game模块内部变量。
+local function prepareDriving(index)
+    local station=assert(Route.GetStations()[index])
+    local train=Train.ExportState()
+    train.s,train.v,train.throttle,train.brake=station.s-100,0,0,1
+    train.moving,train.reversing,train.topology=true,false,nil
+    Train.RestoreState(train)
+    Passenger.Reset()
+    local game=Game.ExportState()
+    game.state,game.nextIndex,game.lastArrival="driving",index,index-1
+    game.initialService,game.timetable,game.dwellTimer=false,nil,0
+    game.travelReversing,game.arrivalReversing,game.rewarded=false,false,{}
+    Game.RestoreState(game)
+    -- 夹具Reset使visits归零；先经过main观察一次驾驶态，避免与上次到站visits=1相同。
+    step(.02)
+end
+local function completeRealStop(nextIndex)
+    local visits=Passenger.GetStats().visits
+    -- 后续访问不Reset/Restore客流和Game。真实乘降、最低站停、信号、关门、发车均走main。
+    for _=1,1800 do
+        if not Game.IsDwelling() then break end
+        step(.2)
+    end
+    check(not Game.IsDwelling() and assert(Game.GetNextStation()).index==nextIndex,"真实连续乘降后未发车到下一站")
+    check(Passenger.GetStats().visits==visits,"真实离站错误更改访问计数")
+    local train=Train.ExportState()
+    train.s,train.v,train.throttle,train.brake=assert(Route.GetStations()[nextIndex]).s-100,0,0,1
+    train.moving=true
+    Train.RestoreState(train)
+    step(.02)
+    return visits
+end
+local function arrive(index)
+    local before=status().accepted
+    local station=assert(Route.GetStations()[index])
+    local train=Train.ExportState()
+    train.s,train.v,train.throttle,train.brake=station.s-.1,0,0,1
+    train.moving,train.reversing=true,false
+    Train.RestoreState(train)
+    step(.02)
+    local actual=status()
+    check(Game.IsDwelling() and Passenger.HasActiveStop(),"main固定步没有真实到站乘降")
+    check(actual.accepted>before and actual.lastEvent.kind=="arrival" and actual.lastEvent.index==index,
+        "main->Game到站->Feedback->Announcements没有接受新到站")
+    -- 生产契约不强切正在播的短片段；压缩区间旅行后可仍在播放departure/approach。
+    -- 读档首次到站必须真正派发chime；连续到站以新arrival入队+后续clear验证，不强迫抢断。
+    check(index==2 and actual.activePath==Catalog.Chime
+        or index>2 and actual.queued>0 and actual.activePath~="","新到站没有实际音频/待播队列")
+    print(string.format(PREFIX.."REAL_MAIN_ARRIVAL_ACCEPTED index=%d accepted=%d activePath=%s instance=%d",
+        index,actual.accepted,actual.activePath,created_))
+end
+local function assertDiscarded(reason)
+    local actual=status()
+    check(actual.queued==0 and actual.activePath=="" and not actual.playing,reason.."后保留旧播放/队列")
+end
+local function settingsOpen()
+    local root=assert(Hud.GetRoot())
+    if not Hud.GetReadings().operationsExpanded then tap(root,"toggleOperations") end
+    tap(root,"openSettings","operationsDetails")
+    check(GetApplicationState()=="settings","真实设置按钮无效")
+end
+local function languageTo(target)
+    for _=1,4 do
+        if fixture_.settings.language==target then return end
+        tap(assert(Menu.GetRoot()),"settingsLanguage")
+    end
+    check(fixture_.settings.language==target,"语言真实按钮无法循环到目标")
+end
+local function focus(value)
+    local event=VariantMap();event["Focus"]=value
+    HandleApplicationPaused("InputFocus",event --[[@as InputFocusEventData]])
+end
+local function blockAndRestore()
+    local reason=reasons_[round_]
+    oldAccepted_=status().accepted
+    if reason=="master" then
+        volume("volume",0);check(status().masterVolume==0,"主音量未传给main真实广播实例")
+        assertDiscarded(reason);volume("volume",.75)
+    elseif reason=="announcement" then
+        volume("announcementVolume",0);check(status().volume==0,"广播音量未传给main真实广播实例")
+        assertDiscarded(reason);volume("announcementVolume",.75)
+    elseif reason=="language" then
+        settingsOpen();languageTo("off")
+        check(status().language=="off","设置语言没有作用到真实广播实例")
+        assertDiscarded(reason);languageTo("zh")
+        tap(assert(Menu.GetRoot()),"settingsBack")
+        check(Hud.GetReadings().paused,"设置返回未保留安全暂停")
+        TogglePause()
+    else
+        focus(false);check(Hud.GetReadings().paused and status().blocked,"后台未暂停实际main和广播")
+        assertDiscarded(reason);focus(true)
+        check(Hud.GetReadings().paused,"前台恢复错误自动解暂停")
+        TogglePause()
+    end
+    assertDiscarded(reason.."恢复")
+    check(status().accepted==oldAccepted_,reason.."恢复凭空接受旧事件")
+    transition("no-replay")
+end
+local function finish()
+    check(reads_>0 and writes_>0 and cloudCalls_==0,"内存/云隔离未真正覆盖")
+    cleanup();check(not failed_,"Stop清理失败")
+    done_=true
+    print(string.format("REAL_MAIN_AUDIO_REENTRY_PASS checks=%d frames=%d instances=%d freshArrivals=5 normalRoute=%s length=%.6f stations=10 decoderProgress=%.3f device=%s playerSaveIO=0 externalCloudCalls=0 gpuPixelsValidated=false audibleValidated=false hostAudioResumeInjected=%s",
+        checks_,frames_,created_,Modes.Get("normal").routeId,Modes.Get("normal").routeLength,voiceMax_,tostring(device_),tostring(device_)))
+    engine:Exit()
+end
 function Start()
-    startGame()
-    local root = assert(Hud.GetRoot())
-    local selector = assert(root:FindById("trainSelector")) --[[@as CabTrainSelector]]
-    assert(selector == Hud.GetTrainSelector(), "选择器实例未正确挂载")
-    assert(#Train.GetCatalog() == 6, "车型目录不是6项")
-    local dimensions = Station.GetDimensions()
-    assert(dimensions.maxTrainWidth >= 3.38 and dimensions.sideGap >= .20,
-        "站台没有为最大宽度动车保留净空")
-    assert(Hud.GetReadings().selectedTrainId == Train.GetSelectedId(), "初始显示车型不一致")
-    local firstStation = Route.GetStations()[1]
-    assert(math.abs(Train.GetS()-(firstStation.s+1)) < .01, "开局没有位于北京站内")
-    assert(Game.GetNextStation().index == Route.GetStations()[2].index, "开局站序不是下一站天津")
-    Game.CheckArrival()
-    assert(Game.GetXp() == 0 and not Game.IsDwelling(), "出生原地误发到站奖励")
-    Train.Reset(firstStation.s - 120)
-
-    local elapsed, s = Game.GetElapsed(), Train.GetS()
-    tapButton("openTrainSelector")
-    assert(Hud.IsTrainSelectorOpen(), "真实车型按钮未打开选择器")
-    assert(Hud.GetReadings().paused, "打开选择器没有暂停")
-    step()
-    assert(Game.GetElapsed() == elapsed and Train.GetS() == s, "选择器打开后仍推进游戏")
-    tapButton("closeTrainSelector")
-    assert(not Hud.IsTrainSelectorOpen(), "真实关闭按钮未关闭选择器")
-    assert(not Hud.GetReadings().paused, "关闭菜单没有恢复原非暂停状态")
-    TogglePause()
-    tapButton("openTrainSelector")
-    tapButton("cancelTrainSelection")
-    assert(Hud.GetReadings().paused, "关闭菜单错误清除了用户暂停")
-
-    local xp, nextStation = Game.GetXp(), Game.GetNextStation().index
-    assert(audio:GetListener() and audio:GetListener().node == TrainCamera.GetNode(),
-        "声音监听没有绑定当前相机听者")
-    local scene = renderer:GetViewport(0).scene
-    local oldRoot = assert(scene:GetChild("Train"))
-    local chosen = ""
-    for _, entry in ipairs(Train.GetCatalog()) do
-        if entry.ready and entry.id ~= Train.GetSelectedId() then chosen = entry.id; break end
-    end
-    assert(chosen ~= "", "没有第二种就绪车型")
-    tapButton("openTrainSelector")
-    tapButton("selectTrain_" .. chosen)
-    assert(selector.pendingId_ == chosen, "真实选择按钮未记录待确认车型")
-    tapButton("confirmTrain")
-    assert(Train.GetSelectedId() == chosen and not Hud.IsTrainSelectorOpen(), "真实确认回调未成功换车")
-    assert(Hud.GetReadings().paused, "换车后错误解除原用户暂停")
-    assert(Train.GetS() == s and Game.GetXp() == xp and Game.GetNextStation().index == nextStation,
-        "换车改变线路位置/经验/站序")
-    assert(Train.GetThrottle() == 0 and Train.GetBrake() == 1, "换车没有收油并制动")
-    assert(scene:GetChild("Train") == oldRoot, "换车销毁了稳定列车根")
-    assert(Audio.GetPowerType() == (Train.GetPowerType() == "diesel" and "diesel" or "electric"),
-        "换车没有同步动力类型")
-    local lead = assert(Train.GetLeadNode())
-    Audio.SetTrainPose(lead.worldPosition, lead.worldRotation)
-
-    local ok = SelectTrain("unknown_train")
-    assert(not ok and Train.GetSelectedId() == chosen, "未知车型改变了当前编组")
-    Train.SetBrake(0)
-    Train.SetThrottle(8)
-    Train.Update(1)
-    assert(math.abs(Train.GetSpeedKmh()) > 0.1, "无法构造行驶换车拒绝测试")
-    local active, movingS = Train.GetSelectedId(), Train.GetS()
-    local rejected = SelectTrain("CR400AF")
-    assert(not rejected and Train.GetSelectedId() == active and Train.GetS() == movingS,
-        "行驶时允许换车或破坏原车")
-    Train.Reset(s)
-    assert(SelectTrain("CR400AF"), "默认复兴号未能选择")
-    assert(Train.GetCarCount() == 8, "复兴号不是8节编组")
-    Game.UpdateHud(0)
-    Hud.SetTrainSelectorOpen(false)
-    Train.Reset(Route.GetStations()[1].s - 35)
-    TrainCamera.AddYaw(160) -- 朝站房与种植区一侧，仍由第三人称库和净空射线驱动。
-    print("[MainIntegration] 菜单暂停恢复、停车确认、拒绝行驶换车、进度/音频根保留全部通过")
-    SubscribeToEvent("Update", "HandleIntegrationUpdate")
-    SubscribeToEvent("EndRendering", "HandleIntegrationCapture")
-end
-
----@param eventType string
----@param eventData UpdateEventData
-function HandleIntegrationUpdate(eventType, eventData)
-    -- main 已订阅Update，验收不能再调用一次而使列车/计时双倍推进。
-    -- 测试入口不会自动回调 main 的 PostUpdate，显式驱动相机与流式。
-    HandlePostUpdate("PostUpdate", eventData --[[@as PostUpdateEventData]])
-    frame_ = frame_ + 1
-    if frame_ == 124 then tapButton("openTrainSelector") end
-    if frame_ == 127 then
-        local selector = assert(Hud.GetTrainSelector())
-        assert(selector:GetPageCount() >= 3, "车型分页数量不正确")
-        selectCatalogTrain("CRH380A")
-        assert(selector.pendingId_ == "CRH380A", "翻页后和谐号选择按钮未命中")
-        tapButton("confirmTrain")
-        assert(Train.GetSelectedId() == "CRH380A", "和谐号真实确认未切换编组")
-        assert(Hud.GetReadings().paused, "翻页选车型解除用户暂停")
-        tapButton("openTrainSelector")
-        for _ = 2, selector:GetPageCount() do
-            local before = selector:GetPage()
-            tapButton("nextTrainPage")
-            assert(selector:GetPage() == before + 1, "下一页按钮没有推进车型页码")
+    guard(function()
+        for _,argument in ipairs(GetArguments()) do if argument=="-main-integration-device" then device_=true end end
+        if device_ then
+            engine:SetMaxFps(20);engine:SetMaxInactiveFps(20)
+            -- 仅测试宿主首次触摸恢复音频的等效注入，不改生产main，不SetMode。
+            check(audio:IsInitialized() and audio:Play(),"SDL disk设备未初始化/宿主等效resume失败")
         end
-        print("[MainIntegration] 逐页触摸并选择和谐号通过")
-    end
-    if frame_ == 130 then
-        local vw, vh = UI.GetViewportSize()
-        local layout = Hud.GetLayout().trainSelector
-        assert(layout.x >= 0 and layout.y >= 0 and layout.w > 200 and layout.h > 180
-            and layout.x + layout.w <= vw + 1 and layout.y + layout.h <= vh + 1,
-            "车型抽屉超出实际屏幕")
-        local readings = Hud.GetReadings()
-        local limit = Game.GetSpeedLimit()
-        assert(readings.speedLimitKmh == limit and readings.instrumentLimitKmh == limit,
-            "速度策略没有同步到实际仪表")
-        assert(readings.instrumentMaxKmh >= Train.GetMaxSpeedKmh(), "动车速度表量程仍停留在旧值")
-        print("[MainIntegration] 实际屏幕抽屉布局与限速显示通过")
-    elseif frame_ == 136 then
-        Hud.SetTrainSelectorOpen(false)
-    elseif frame_ == 142 then
-        Train.Reset(1100)
-        TrainCamera.SetMode("side")
-        Game.UpdateHud(0)
-    elseif frame_ == 169 then
-        TrainCamera.SetMode("cab")
-    end
+        started_=true;mainStart();begin(false)
+    end)
 end
-
----@param eventType string
----@param eventData EndRenderingEventData
-function HandleIntegrationCapture(eventType, eventData)
-    if frame_ == 123 or frame_ == 132 or frame_ == 140 or frame_ == 165 or frame_ == 180 then
-        local image = Image()
-        assert(graphics:TakeScreenShot(image), "实际帧截图失败")
-        local names = {
-            [123] = "modern_station", [132] = "train_selector", [140] = "modern_harmony_station",
-            [165] = "modern_curve", [180] = "modern_cab",
-        }
-        local name = assert(names[frame_])
-        assert(image:SavePNG("/workspace/screenshots/" .. name .. ".png"), "验收截图未写入")
-        image:Dispose()
-        print("[MainIntegration] 真实截图: " .. name)
-    end
+function HandleUpdate()
+    guard(function()
+        frames_=frames_+1
+        step(.02)
+        check(frames_-stageFrame_<2400,"有界阶段超时 "..stage_)
+        check(GetApplicationState()~="error","生产main加载/运行失败")
+        if stage_=="loading" and GetApplicationState()=="playing" then
+            check(#Route.GetStations()==10 and math.abs(Route.GetLength()-Modes.Get("normal").routeLength)<.001,
+                "normal不是最新十站地图")
+            check(status().lastEvent.kind=="welcome","新旅程未产生真实main欢迎")
+            firstInstance_=assert(announcements_)
+            prepareDriving(2)
+            check(SaveJourneyNow(),"真实main无法保存内存旅程")
+            savedJourney_=copy(fixture_.journeys.normal)
+            returnMenu()
+            check(firstInstance_.stopped,"返回菜单未Shutdown旧广播实例")
+            begin(true);transition("reentry")
+        elseif stage_=="reentry" and GetApplicationState()=="playing" then
+            check(announcements_~=firstInstance_ and created_==2,"重进没有创建新真实广播实例")
+            check(Hud.GetReadings().paused and status().accepted==0,"读档补播了welcome/旧广播")
+            check(math.abs(Train.GetS()-savedJourney_.train.s)<.001,"重进坐标丢失")
+            assertDiscarded("读档")
+            TogglePause();arrive(2);round_=1;transition("voice")
+        elseif stage_=="voice" then
+            local actual=status()
+            local definition=assert(Catalog.Get("arrival",2))
+            if not device_ and actual.activePath==Catalog.Chime then
+                assert(assert(announcements_).source):StopImmediate()
+                step(.02)
+                actual=status()
+            end
+            if actual.activePath==definition.zhPath then
+                voiceMax_=math.max(voiceMax_,actual.timePosition)
+                if not device_ or voiceMax_>.35 then
+                    check(actual.lastEvent.voicedZh and actual.gain>0,"真实到站配音未带有效增益")
+                    print(string.format(PREFIX.."REAL_MAIN_VOICE_ACTIVE accepted=%d path=%s position=%.3f cpuChimeAdvance=%s",
+                        actual.accepted,actual.activePath,actual.timePosition,tostring(not device_)))
+                    blockAndRestore()
+                end
+            end
+            check(frames_-stageFrame_<350,"重进后实际arrival语音没有进入activePath/解码时钟")
+        elseif stage_=="no-replay" and frames_-stageFrame_>=5 then
+            assertDiscarded(reasons_[round_].."稳定恢复")
+            check(status().accepted==oldAccepted_,"恢复数帧后补播旧事件")
+            print(PREFIX.."NO_STALE_QUEUE_PASS reason="..reasons_[round_].." accepted="..oldAccepted_)
+            if round_==4 then
+                local visits=completeRealStop(6);arrive(6)
+                check(Passenger.GetStats().visits==visits+1,"连续新站没有单调增加真实访问计数")
+                local definition=assert(Catalog.Get("arrival",6))
+                check(status().lastEvent.voicedZh and not status().lastEvent.voicedEn
+                    and status().lastEvent.stationVoice and status().lastEvent.text==definition.text
+                    and status().lastEvent.text:find(assert(Route.GetStations()[6]).name,1,true),
+                    "新站真实中文配音/目标字幕不一致")
+                local coverage=Catalog.GetCoverage()
+                check(#Catalog.GetRecordingPlan()==34 and coverage.generatedChinese==34
+                    and coverage.generatedStationChinese==30 and coverage.chineseStationVoices
+                    and coverage.namedChineseStations==10 and coverage.unvoicedChineseStations==0,
+                    "十站34条正式中文配音覆盖不完整")
+                local job=assert(assert(announcements_).queue[1])
+                check(job.definition.kind=="arrival" and job.definition.index==6 and #job.clips==2
+                    and job.clips[1]==Catalog.Chime and job.clips[2]==definition.zhPath,
+                    "新站队列没有提示音及准确目标录音")
+                voiceMax_=0
+                transition("new-chime")
+            else
+                round_=round_+1
+                local visits=completeRealStop(round_+1);arrive(round_+1)
+                check(Passenger.GetStats().visits==visits+1,"连续到站没有单调增加访问计数")
+                transition("next-block")
+            end
+        elseif stage_=="next-block" then blockAndRestore()
+        elseif stage_=="new-chime" then
+            if not device_ and status().activePath~=Catalog.Chime then
+                assert(assert(announcements_).source):StopImmediate();step(.02)
+            end
+            if status().activePath==Catalog.Chime then
+                print(PREFIX.."NEW_STATION_CAPTION_CHIME_PASS index=6 voiced=true activePath="..status().activePath)
+                transition("new-voice")
+            end
+        elseif stage_=="new-voice" then
+            local definition=assert(Catalog.Get("arrival",6))
+            if not device_ and status().activePath==Catalog.Chime then
+                assert(assert(announcements_).source):StopImmediate();step(.02)
+            end
+            local actual=status()
+            if actual.activePath==definition.zhPath then
+                voiceMax_=math.max(voiceMax_,actual.timePosition)
+                if not device_ or voiceMax_>.35 then
+                    check(actual.lastEvent.voicedZh and actual.gain>0 and actual.caption==definition.text
+                        and assert(assert(announcements_).source):GetSound()==assert(announcements_).sounds[assert(definition.zhPath)],
+                        "真实main扩线到站录音未绑定准确Sound或增益/字幕异常")
+                    print(string.format(PREFIX.."NEW_STATION_VOICE_ACTIVE_PASS index=6 path=%s position=%.3f cpuChimeAdvance=%s audibleValidated=false",
+                        actual.activePath,actual.timePosition,tostring(not device_)))
+                    finish()
+                end
+            end
+            check(frames_-stageFrame_<350,"新站真实arrival录音没有进入activePath/解码时钟")
+        end
+    end)
 end
+function HandlePostUpdate(eventType,eventData)
+    guard(function() mainPost(eventType,eventData) end)
+end
+function Stop() cleanup() end

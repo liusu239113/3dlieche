@@ -169,6 +169,46 @@ TrainCatalog.Profiles = {
         underframeTop = -.083, transitionTop = -.051,
         description = "实际LOD0 yaw +89.991540°；两侧外踏面高于内轮缘，避开整体minY校准。",
     },
+    -- 四款独立生成长途平端客车。ROI由tests/CoachModelProbe在LOD0旋正顶点上实测，
+    -- 左右踏面按朝下法线分侧取样，不是套用机车或动车参数。
+    -- 机车牵引客车靠车钩连接，端部为带圆角车顶的贯通门，不适用动车的满宽风挡端面验收，
+    -- 因此不设expectedShape；风挡端面仅用于动车内部连接。
+    blue_white_coach = {
+        id = "blue_white_coach", modelId = "f24f03ef03e94627ba410efae414df3e",
+        length = 25.000, width = 3.100, height = 4.050, pivot = 8.750,
+        cab = Vector3.ZERO, forwardSign = 1, verified = true,
+        contactLeft = { x0 = -.085, x1 = -.058, y0 = -.155, y1 = -.136, z0 = -.490, z1 = .490 },
+        contactRight = { x0 = .058, x1 = .085, y0 = -.155, y1 = -.136, z0 = -.490, z1 = .490 },
+        underframeTop = -.123, transitionTop = -.063,
+        description = "沧羽系独立生成长途客车，双平端贯通门、无驾驶室；LOD0 PCA yaw +43.221947°。",
+    },
+    DF4D_coach = {
+        id = "DF4D_coach", modelId = "f0276be35e6648f9bd819305cab10159",
+        length = 25.000, width = 3.100, height = 4.050, pivot = 8.750,
+        cab = Vector3.ZERO, forwardSign = 1, verified = true,
+        contactLeft = { x0 = -.070, x1 = -.045, y0 = -.158, y1 = -.140, z0 = -.490, z1 = .490 },
+        contactRight = { x0 = .042, x1 = .068, y0 = -.158, y1 = -.140, z0 = -.490, z1 = .490 },
+        underframeTop = -.125, transitionTop = -.065,
+        description = "赤峦系独立生成长途客车，双平端贯通门、无驾驶室；LOD0 PCA yaw +41.474459°。",
+    },
+    SS9G_coach = {
+        id = "SS9G_coach", modelId = "3970f65da0f14917b1c97ed296e2cd35",
+        length = 25.000, width = 3.100, height = 4.050, pivot = 8.750,
+        cab = Vector3.ZERO, forwardSign = 1, verified = true,
+        contactLeft = { x0 = -.060, x1 = -.036, y0 = -.130, y1 = -.112, z0 = -.490, z1 = .490 },
+        contactRight = { x0 = .042, x1 = .074, y0 = -.130, y1 = -.112, z0 = -.490, z1 = .490 },
+        underframeTop = -.098, transitionTop = -.038,
+        description = "苍穹系独立生成长途客车，双平端贯通门、无驾驶室；LOD0 PCA yaw +36.903828°。",
+    },
+    HXD3D_coach = {
+        id = "HXD3D_coach", modelId = "7010b9a50dd5414d96d9aa94d420dec2",
+        length = 25.000, width = 3.100, height = 4.050, pivot = 8.750,
+        cab = Vector3.ZERO, forwardSign = 1, verified = true,
+        contactLeft = { x0 = -.088, x1 = -.056, y0 = -.140, y1 = -.118, z0 = -.490, z1 = .490 },
+        contactRight = { x0 = .056, x1 = .088, y0 = -.140, y1 = -.118, z0 = -.490, z1 = .490 },
+        underframeTop = -.105, transitionTop = -.045,
+        description = "雷隼系独立生成长途客车，双平端贯通门、无驾驶室；LOD0 PCA yaw +42.032689°。",
+    },
 }
 
 -- 成品LOD0实测记录：轴向法线>0.90，0.10m分箱定位平面，±0.18m车体截面。
@@ -298,6 +338,19 @@ TrainCatalog.Assets = {
         diffusePath = "FictionalLiveries/Xinglan_M35_middle_D.png", normalPath = "FictionalLiveries/Xinglan_M35_middle_N.png" },
     CR400AF_middle = { modelPath = "RollingStockBaked/CR400AF_middle.mdl", metadataPath = "RollingStockBaked/CR400AF_middle.json",
         diffusePath = "FictionalLiveries/Xinglan_M35_spare_D.png", normalPath = "FictionalLiveries/Xinglan_M35_spare_N.png" },
+    -- 四款独立客车成品；diffuse/normal直接引用生成模型自带贴图。
+    blue_white_coach = { modelPath = "RollingStockBaked/blue_white_coach.mdl", metadataPath = "RollingStockBaked/blue_white_coach.json",
+        diffusePath = "model/f24f03ef03e94627ba410efae414df3e/Textures/f24f03ef03e94627ba410efae414df3e_00_D.jpg",
+        normalPath = "model/f24f03ef03e94627ba410efae414df3e/Textures/f24f03ef03e94627ba410efae414df3e_00_N.png" },
+    DF4D_coach = { modelPath = "RollingStockBaked/DF4D_coach.mdl", metadataPath = "RollingStockBaked/DF4D_coach.json",
+        diffusePath = "model/f0276be35e6648f9bd819305cab10159/Textures/f0276be35e6648f9bd819305cab10159_00_D.jpg",
+        normalPath = "model/f0276be35e6648f9bd819305cab10159/Textures/f0276be35e6648f9bd819305cab10159_00_N.png" },
+    SS9G_coach = { modelPath = "RollingStockBaked/SS9G_coach.mdl", metadataPath = "RollingStockBaked/SS9G_coach.json",
+        diffusePath = "model/3970f65da0f14917b1c97ed296e2cd35/Textures/3970f65da0f14917b1c97ed296e2cd35_00_D.jpg",
+        normalPath = "model/3970f65da0f14917b1c97ed296e2cd35/Textures/3970f65da0f14917b1c97ed296e2cd35_00_N.png" },
+    HXD3D_coach = { modelPath = "RollingStockBaked/HXD3D_coach.mdl", metadataPath = "RollingStockBaked/HXD3D_coach.json",
+        diffusePath = "model/7010b9a50dd5414d96d9aa94d420dec2/Textures/7010b9a50dd5414d96d9aa94d420dec2_00_D.jpg",
+        normalPath = "model/7010b9a50dd5414d96d9aa94d420dec2/Textures/7010b9a50dd5414d96d9aa94d420dec2_00_N.png" },
 }
 
 ---@param id string

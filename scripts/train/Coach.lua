@@ -10,6 +10,9 @@ local MeshUtils = require "core.MeshUtils"
 local Materials = require "config.Materials"
 local FictionalWorld = require "config.FictionalWorld"
 local CoachLiveries = require "config.CoachLiveries"
+local CoachModels = require "config.CoachModels"
+local Catalog = require "config.TrainCatalog"
+local RollingStock = require "train.RollingStock"
 
 ---@class CoachBogie
 ---@field node Node 枢轴位于局部(0,0,z)，子部件高度采用线路基准。
@@ -19,6 +22,8 @@ local CoachLiveries = require "config.CoachLiveries"
 ---@field wheels Node[] 八个独立车轮节点，挂在各自转向架下。
 ---@field bogies CoachBogie[] 两个可独立转向的转向架枢轴。
 ---@field wheelRadius number 踏面滚动半径.46米，不是轮缘半径。
+---@field assetNode Node|nil 实际独立MDL节点；程序化样板无此字段。
+---@field drawable StaticModel|nil 实际绑定的独立MDL，不从来源标签推断。
 
 local Coach = {}
 Coach.Length = 24.0
@@ -54,6 +59,8 @@ Coach.AxleSpacing = 2.40
 ---@field rubber Material
 ---@field glass Material
 ---@field detail Material
+---@field door Material
+---@field accent Material
 
 ---@type table<string, CoachMaterials>
 local materialCache = {}
@@ -115,6 +122,7 @@ local function Textured(path, color, metallic, roughness, normalPath, clamp)
         print("[Coach] 贴图缺失，回退到PBR纯色材质：" .. path)
         return Materials.Solid(color, metallic, roughness)
     end
+    if normalPath and not MeshUtils.SupportsTangents() then normalPath = nil end
     local material = Material:new()
     local techniquePath = normalPath and "Techniques/PBR/PBRDiffNormal.xml"
         or "Techniques/PBR/PBRDiff.xml"
@@ -703,8 +711,119 @@ local function BuildWheel(parent, side, axleZ)
     return wheel
 end
 
+--- 正式目录机车必须有独立成品；旧程序化样板仅供显式非目录工具使用。
+---@param locomotiveId string
+---@return boolean
+function Coach.RequiresIndependentProfile(locomotiveId)
+    local entry = Catalog.Find(locomotiveId)
+    return entry ~= nil and entry.kind == "locomotive"
+end
+
+--- 只接受有生成来源记录且专属本机车的真实客车profile；不挪用动车或车头。
+---@param locomotiveId string
+---@return string|nil, string
+function Coach.GetIndependentProfile(locomotiveId)
+    local spec = CoachModels.Find(locomotiveId)
+    if not spec or not spec.profileId then
+        return nil, Coach.RequiresIndependentProfile(locomotiveId)
+            and "正式车队缺少独立客车成品配置，禁止程序化代用" or "独立生成主体尚未交付"
+    end
+    if spec.locomotiveId ~= locomotiveId or spec.source ~= "generated_asset"
+        or not spec.reviewConfirmed or not spec.assetId or spec.assetId == "" then
+        return nil, "独立客车来源/用户确认记录不完整"
+    end
+    local profileId = spec.profileId
+    local profile = Catalog.Profiles[profileId]
+    if not profile or not Catalog.Assets[profileId] or not profile.verified
+        or profile.pivot <= 0 then
+        return nil, "独立客车缺少成品配置或轮轨校准"
+    end
+    if profile.expectedShape == "single_cab" then
+        return nil, "独立客车端部不可是带驾驶室的单端机车"
+    end
+    for _, entry in ipairs(Catalog.Entries) do
+        if entry.head == profileId or entry.middle == profileId then
+            return nil, "禁止把既有车头/动车中间车冒充独立机车客车"
+        end
+        local usedProfiles = {entry.head}
+        if entry.middle then usedProfiles[#usedProfiles+1] = entry.middle end
+        for _, usedId in ipairs(usedProfiles) do
+            local usedProfile, usedAsset = Catalog.Profiles[usedId], Catalog.Assets[usedId]
+            if (usedProfile and usedProfile.modelId == profile.modelId)
+                or (usedAsset and usedAsset.modelPath == Catalog.Assets[profileId].modelPath) then
+                return nil, "独立客车不能仅为既有车头/动车资产改profile名字"
+            end
+        end
+        if entry.roles then
+            for _, role in ipairs({entry.roles.head,entry.roles.middle,entry.roles.tail}) do
+                if role.profile == profileId then return nil, "禁止复用其他车型角色冒充独立客车" end
+            end
+        end
+    end
+    for otherId, other in pairs(CoachModels.ByLocomotive) do
+        if otherId ~= locomotiveId then
+            local otherProfile = other.profileId and Catalog.Profiles[other.profileId]
+            local otherAsset = other.profileId and Catalog.Assets[other.profileId]
+            if other.profileId == profileId or other.assetId == spec.assetId
+                or (otherProfile and otherProfile.modelId == profile.modelId)
+                or (otherAsset and otherAsset.modelPath == Catalog.Assets[profileId].modelPath) then
+                return nil, "四款客车不得仅换色共享同一个生成主体"
+            end
+        end
+    end
+    return profileId, "真实独立生成客车已配置"
+end
+
+---@class CoachAssetStatus
+---@field source string generated_asset|procedural_placeholder|unverified_asset
+---@field accepted boolean
+---@field message string
+---@field profileId string|nil
+
+---@param locomotiveId string
+---@return CoachAssetStatus
+function Coach.GetAssetStatus(locomotiveId)
+    local profileId, message = Coach.GetIndependentProfile(locomotiveId)
+    if not profileId then
+        local spec = CoachModels.Find(locomotiveId)
+        return {source=(Coach.RequiresIndependentProfile(locomotiveId) or (spec and spec.profileId))
+                and "unverified_asset" or "procedural_placeholder",
+            accepted=false,message=message}
+    end
+    -- 机车牵引客车靠车钩连接，不做动车式满宽风挡端面验收；
+    -- 只要没有单端驾驶室(GetIndependentProfile已拒绝)且成品可用即视为可接入。
+    if not RollingStock.IsAvailable(profileId) then
+        return {source="unverified_asset",accepted=false,profileId=profileId,
+            message="独立客车成品未交付或未包含在发布包"}
+    end
+    local profile = Catalog.Profiles[profileId]
+    return {source="generated_asset",accepted=true,profileId=profileId,
+        message="独立生成客车已交付，轮轨实测验收通过（" .. (profile and profile.description or "") .. "）"}
+end
+
+--- 正式目录缺少独立成品即失败，不能偷偷用程序化客车拼成“成功”编组。
+---@param locomotiveId string
+---@return boolean, string
+function Coach.Prepare(locomotiveId)
+    local spec = CoachModels.Find(locomotiveId)
+    if not spec or not spec.profileId then
+        if Coach.RequiresIndependentProfile(locomotiveId) then
+            local _, message = Coach.GetIndependentProfile(locomotiveId)
+            return false, message
+        end
+        return true, "显式非目录程序化样板"
+    end
+    local profileId, message = Coach.GetIndependentProfile(locomotiveId)
+    if not profileId then return false, message end
+    local available, reason = RollingStock.EnsureBakedAvailable(profileId)
+    if not available then return false, reason end
+    local status = Coach.GetAssetStatus(locomotiveId)
+    if not status.accepted then return false, status.message end
+    return RollingStock.Prepare(profileId)
+end
+
 --- 切换客车队涂装。几何缓冲与转向架/车轮共享缓存不随车队重建；
---- 只有车体材质按涂装重新烘焙，因此换车队不增加几何或节点数量。
+--- 此缓存只属于程序代用，不代表已交付四个独立生成主体。
 ---@param locomotiveId string|nil 机车内部 ID
 ---@return string 实际生效的涂装名
 function Coach.SelectLivery(locomotiveId)
@@ -728,11 +847,34 @@ function Coach.GetLiveryId() return livery_.id end
 ---@param parent Node
 ---@param index integer 首节客车为1，其+Z端车钩y1.42，其余端车钩y1.04。
 ---@param forwardSign? number 动画方向策略，默认为+1。
+---@param locomotiveId? string 使用此机车已确认的独立客车；省略时沿用所选客车队。
 ---@return CoachBuildResult
-function Coach.Build(parent, index, forwardSign)
+function Coach.Build(parent, index, forwardSign, locomotiveId)
+    local fleetId = locomotiveId or livery_.id
+    local spec = CoachModels.Find(fleetId)
+    -- 在写标签/创建网格之前拒绝缺配置，保证直接调用Build也不能绕过正式目录策略。
+    assert(not Coach.RequiresIndependentProfile(fleetId) or (spec and spec.profileId),
+        "正式车队缺少独立客车成品配置，禁止程序化代用")
     parent:SetVar("DisplayName", Variant(FictionalWorld.coachName))
     parent:SetVar("LiveryName", Variant(livery_.name))
     parent:SetVar("FleetNumber", Variant(string.format("%s-%02d", livery_.code, index)))
+    if spec and spec.profileId then
+        local ok, message = Coach.Prepare(fleetId)
+        assert(ok, message)
+        local profileId = assert(Coach.GetIndependentProfile(fleetId))
+        local assetNode, drawable = RollingStock.Build(parent, profileId)
+        local asset = assert(Catalog.Assets[profileId])
+        assert(drawable.model and drawable.model == cache:GetResource("Model", asset.modelPath),
+            "独立客车实际MDL绑定与交付成品不一致")
+        parent:SetVar("CoachAssetSource", Variant("generated_asset"))
+        parent:SetVar("CoachProfile", Variant(profileId))
+        print(string.format("[Coach] %s 第%d节：独立生成成品 %s；共享MDL，不重建车体或叠加程序轮组",
+            fleetId,index,profileId))
+        -- 此独立成品包含真实轮组；没有分离部件时不能再加旧Coach轮/底架假装动画。
+        return {wheels={},bogies={},wheelRadius=Coach.WheelRadius,assetNode=assetNode,drawable=drawable}
+    end
+    parent:SetVar("CoachAssetSource", Variant("procedural_placeholder"))
+    parent:SetVar("CoachProfile", Variant("coach"))
     -- 唯一几何差异是首节+Z端高车钩；不是按每个车号复制整个车体缓冲。
     local key = index == 1 and "first" or "standard"
     local meshes = bodyCache[key]

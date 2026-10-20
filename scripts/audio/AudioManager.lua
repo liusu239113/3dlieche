@@ -3,6 +3,7 @@
 -- 源、WAV buffer 与自建 Sound 强持有；暂停和用户静音独立。
 local Profiles = require "audio.AudioProfiles"
 local AudioCache = require "audio.AudioCache"
+local Soundscape = require "audio.Soundscape"
 local AudioManager = {}
 
 local LOOP_TYPE = "FantasyRail.Loops"
@@ -92,7 +93,8 @@ local announcerSource_ = nil
 local profile_ = Profiles.Default("diesel")
 local environment_ = "city"
 local suspended_ = false
-local volume_ = .55
+local volume_ = .75
+local trainVolume_, ambienceVolume_ = 1.0, .45
 local enabled_ = true -- 新生成声以低响度素材和保守主音量淡入
 local smoothedSpeed_ = 0.0
 local smoothedThrottle_ = 0.0
@@ -158,11 +160,9 @@ end
 ---@param kind string
 ---@return ProceduralSound|nil
 local function cueClip(profile, kind)
-    if kind == "brake" then
-        local path = "audio/sfx/comfort/comfort_brake_air.wav"
-        return ownedClip(path, function() return nil end)
-    end
-    return nil -- 不再播放旧尖锐提示音、制动音或程序气笛
+    local path = kind == "brake" and profile.brakePath or nil
+    if not path then return nil end -- 不再播放旧尖锐提示音或程序气笛
+    return ownedClip(path, function() return nil end)
 end
 
 ---@param name string
@@ -349,6 +349,7 @@ end
 local function refreshPlaybackState()
     local blocked = suspended_ or not enabled_
     if blocked then
+        Soundscape.SetTrainMix(0,0,smoothedSpeed_,smoothedThrottle_/8)
         for _, bank in ipairs(banks_) do
             for _, entry in ipairs(bank.loops) do entry.source:SetGain(0) end
         end
@@ -396,6 +397,29 @@ end
 function AudioManager.GetVolume() return volume_ end
 function AudioManager.IsEnabled() return enabled_ end
 
+---@param value number
+function AudioManager.SetTrainVolume(value)
+    local target=clamp(value,0,1)
+    if trainVolume_==target then return end
+    trainVolume_=target
+    for _,bank in ipairs(banks_) do
+        for _,entry in ipairs(bank.loops) do
+            entry.gain=0;entry.source:SetGain(0)
+        end
+    end
+    for _,entry in ipairs(environments_) do entry.gain=0;entry.source:SetGain(0) end
+    -- 降低列车音量先撤销背景预算，下一次Update按实际输出重新分配。
+    Soundscape.SetTrainMix(0,0,smoothedSpeed_,smoothedThrottle_/8)
+    Soundscape.Update(0)
+end
+---@param value number
+function AudioManager.SetAmbienceVolume(value)
+    local target=clamp(value,0,1)
+    if ambienceVolume_==target then return end
+    ambienceVolume_=target
+    for _,entry in ipairs(environments_) do entry.gain=0;entry.source:SetGain(0) end
+end
+
 ---@param profile FantasyAudioProfile
 ---@param layer string
 ---@return number, number
@@ -403,10 +427,10 @@ local function trainTargets(profile, layer)
     local speed = math.max(0, smoothedSpeed_)
     local ratio = clamp(speed / profile.speedScale, 0, 1.5)
     local load = clamp(smoothedThrottle_ / profile.throttleNotches, 0, 1)
-    if layer == "idle" then return .42 * (1 - .35 * math.min(1,ratio)), 1 end
-    -- 启动时随牵引淡入，惯行仍保留轮轨；只调响度，不把采样升频变成尖啸。
+    if layer == "idle" then return .64 * (1 - .35 * math.min(1,ratio)), 1 end
+    -- 列车优先；复用柔和WAV，保留采样原速，不靠升频制造尖啸。
     local moving = 1 - math.exp(-speed / 12)
-    return (.12 * load + .55 * moving) * (environment_=="tunnel" and 1.08 or 1), 1
+    return (.28 * load + .82 * moving) * (environment_=="tunnel" and 1.04 or 1), 1
 end
 
 ---@param entry FantasyLoopSource
@@ -414,7 +438,7 @@ end
 ---@param pitch number
 ---@param dt number
 local function updateLoop(entry, gain, pitch, dt)
-    entry.gain = smooth(entry.gain, clamp(gain, 0, .78), dt, gain > entry.gain and 6 or 4)
+    entry.gain = smooth(entry.gain, clamp(gain, 0, .95), dt, gain > entry.gain and 6 or 8)
     entry.pitch = 1
     entry.source:SetGain(entry.gain * volume_)
     entry.source:SetFrequency(entry.clip.sound:GetFrequency() * entry.pitch)
@@ -482,10 +506,19 @@ function AudioManager.Update(dt, speedKmh, throttle, stationDistance)
         else
             for _, entry in ipairs(bank.loops) do
                 local gain, pitch = trainTargets(bank.profile, entry.layer)
-                updateLoop(entry, gain * bank.mix, pitch, step)
+                updateLoop(entry, gain * bank.mix * trainVolume_, pitch, step)
             end
         end
     end
+    local referenceRms,referencePeak=0.0,0.0
+    for _,bank in ipairs(banks_) do
+        for _,entry in ipairs(bank.loops) do
+            referenceRms=math.max(referenceRms,entry.clip.stats.rms*entry.gain)
+            referencePeak=math.max(referencePeak,entry.clip.stats.peak*entry.gain)
+        end
+    end
+    Soundscape.SetTrainMix(referenceRms,referencePeak,smoothedSpeed_,smoothedThrottle_/8)
+    local environmentRms,environmentPeak=0.0,0.0
     for _, entry in ipairs(environments_) do
         local gain = 0.0
         if entry.generatedEnvironment then
@@ -505,7 +538,15 @@ function AudioManager.Update(dt, speedKmh, throttle, stationDistance)
             elseif entry.layer == "river" then gain = .24
             else gain = .16 + .11 * clamp(smoothedSpeed_ / 140, 0, 1) end
         end
-        updateLoop(entry, gain, 1, step)
+        updateLoop(entry, gain * ambienceVolume_ * Soundscape.GetBackgroundDuck(), 1, step)
+        environmentRms=environmentRms+entry.gain*entry.clip.stats.rms
+        environmentPeak=environmentPeak+entry.gain*entry.clip.stats.peak
+    end
+    -- 整个环境总预算，而非给每个交叉淡入层分别算满。
+    local scale=math.min(1,referenceRms*.12/math.max(environmentRms,.000001),
+        referencePeak*.12/math.max(environmentPeak,.000001))
+    for _,entry in ipairs(environments_) do
+        entry.gain=entry.gain*scale;entry.source:SetGain(entry.gain*volume_)
     end
     monitorTimer_ = monitorTimer_ + step
     if monitorTimer_ >= 1 then monitorTimer_ = 0; monitorLoops() end
@@ -642,7 +683,8 @@ function AudioManager.GetDiagnostics()
         mixRate = audio:GetMixRate(), loopsPaused = audio:IsSoundTypePaused(LOOP_TYPE),
         failedClips = failedClips_, trainPosition = trainPosition_, trainRotation = trainRotation_,
         synthesis = "generated long loops / offline lowpass / controlled loudness / original sample frequency",
-        volume = volume_,
+        volume = volume_, trainVolume=trainVolume_, ambienceVolume=ambienceVolume_,
+        trainPriority=true, audibleValidated=false,
     }
 end
 

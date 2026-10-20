@@ -12,6 +12,26 @@ local MeshUtils = {}
 -- 几何缓存：同参数几何只建一份 Model，多节点复用
 local _modelCache = {}
 
+-- 运行时是否导出 CustomGeometry:GenerateTangents。旧运行时缺失该方法，
+-- 手写几何拿不到切线；法线贴图材质此时会整片发黑，必须退回无法线技术。
+---@type boolean?
+local _tangentSupport = nil
+---@return boolean
+function MeshUtils.SupportsTangents()
+    if _tangentSupport == nil then
+        -- 探测失败一律按不支持处理：宁可少一层法线细节，也不能让世界加载中断。
+        local ok, result = pcall(function()
+            local probe = Node():CreateComponent("CustomGeometry")
+            local supported = type(probe.GenerateTangents) == "function"
+            probe:Dispose()
+            return supported
+        end)
+        _tangentSupport = ok and result == true
+        print("[MeshUtils] 运行时切线生成：" .. (_tangentSupport and "可用" or "不可用，法线贴图退回无法线技术"))
+    end
+    return _tangentSupport
+end
+
 local function cacheKey(...)
     local parts = {}
     for i = 1, select("#", ...) do
@@ -254,7 +274,11 @@ function GeoBuilder:CommitTo(node, material)
         cg:DefineNormal(self.norms[i])
         cg:DefineTexCoord(self.uvs[i])
     end
-    cg:GenerateTangents()
+    -- 某些运行时会暴露方法名但实际调用失败；切线只是可选细节，不能阻断场景提交。
+    local generateTangents = cg.GenerateTangents
+    if type(generateTangents) == "function" then
+        pcall(generateTangents,cg)
+    end
     cg:Commit()
     cg:SetMaterial(material)
     local count = self._n

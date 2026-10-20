@@ -11,6 +11,12 @@ end
 
 function Start()
     local success, message = pcall(function()
+        assert(Policy.ServiceDeceleration(.7,0)==.7,"平地标称制动力改变")
+        local downhill=Policy.ServiceDeceleration(.7,.022)
+        assert(downhill>.48 and downhill<.49,"22‰下坡未扣除重力")
+        assert(Policy.ServiceDeceleration(.7,-.022)==.7,"上坡错误增加允许速度")
+        assert(Policy.ApproachLimit(1000,0,downhill,100)<Policy.ApproachLimit(1000,0,.7,100),
+            "下坡未提前降低制动提示速度")
         assert(Policy.Calculate(input(1000, 350)) == 350, "复兴号区间不是350")
         assert(Policy.Calculate(input(1000, 300)) == 300, "和谐号区间不是300")
         assert(Policy.Calculate(input(1000, 120)) == 120, "普速机车被错误放到350")

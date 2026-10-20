@@ -1,33 +1,54 @@
 {
   "$schema": "../schemas/project.schema.json",
-  "project_id": "m_7h6f",
+  "project_id": "m_vx1f",
   "author": {
     "id": "655765888"
   },
   "entry": "main.lua",
-  "version": "1.0.0",
+  "version": "1.0.26",
   "taptap_publish": {
-    "title": "星澜群域 · 铁路旅程",
-    "description": "",
+    "title": "TRS实况铁路模拟",
+    "description": "驾驶六款架空车队，穿越星澜群域，在铁路运营与自由试验中体验“涌现”。\n\n【普通模式·十站山海干线】星汐—天池线路约88.9公里，保留星汐、岚港、榆岑、镜澜、云湾五站，新增翠川、石门、云脊、松岚、天池五站。沿线城郊、河谷与连续山地相接，新增五座高谷铁路桥、五条穿岭隧道，真实上下坡影响牵引与制动。\n\n【狂暴模式·凌岳天路】独立约133.6公里山地地图，包含回头展线、高桥峡谷与高原山口。多车型列车正常成列行驶；你可以选择进路、主动碰撞，观察撞击与交通状态相互作用形成连锁。该模式取消线路限速与超速侧翻，不强制客运任务。\n\n【拟真驾驶与运营】8档油门、空气制动、紧急制动、换向、汽笛和真实道岔选路。普通模式保留车型、曲线、站场及制动限速与危险驾驶事故；支持站站停、快速大站停、侧线待避训练。乘客逐人登降，停车精度和运行平稳度影响评分。\n\n【六款车队与昼夜行旅】沧羽D12、赤峦D18、苍穹E21、雷隼E32、流萤M30、星澜M35，各有动力与制动手感。多机位切换，夜间车灯、站台及道路照明；触屏可主动切换车灯和滚动调节分轨音量。普通与狂暴使用不同音乐。原五站具备中文站名广播，新增五站目前提供字幕与提示音。\n\n支持键鼠与触屏操作，两种模式的旅程分别保存。旧地图旅程更新时保留累计成绩和原旅程备份，从新线路始发站安全接续。游戏持续优化中，欢迎反馈。",
     "category": "simulation",
     "screen_orientation": "landscape",
     "collection_type": "simulation",
-    "trial_note": "",
+    "trial_note": "游戏目前持续优化完善大家有已经可以及时反馈论坛",
     "app_platforms": "1,2",
-    "developer_id": 403350,
-    "app_id": 962369,
-    "miniapp_id": "tapmcl9xqmlid9ubhp"
+    "developer_id": 377480,
+    "app_id": 953972,
+    "miniapp_id": "tapmcknfg0eaqznrnf",
+    "gameplay_demo_video_source": "https://tapcode-sce.spark.xd.com/videos/e67687fd-ee7b-4bdf-a0ba-09c34424dd80/1792382038349-uploaded_69463b86.mp4",
+    "release_phase": "public_test"
   },
   "assets": {
-    "icon": "",
-    "screenshots": [],
-    "promotional_image": ""
+    "icon": "./assets/image/trs_icon_modern_20261012052607.png",
+    "screenshots": [
+      "./game_material/SCREENSHOT_2026-10-12T05-24-33_01.png",
+      "./game_material/SCREENSHOT_2026-10-12T05-24-59_02.png",
+      "./game_material/SCREENSHOT_2026-10-12T05-25-23_03.png"
+    ],
+    "promotional_image": "./assets/image/trs_promo_v3_20261012065626.png",
+    "source_screenshots": [
+      "game_material/_src/trs_3.jpg"
+    ],
+    "icon_url": "https://tapcode-sce.spark.xd.com/assets/game_material/m_vx1f/trs_icon_modern_20261012052607.png",
+    "screenshot_urls": [
+      "https://tapcode-sce.spark.xd.com/assets/game_material/TRS实况铁路模拟/SCREENSHOT_2026-10-12T05-24-33_01.png",
+      "https://tapcode-sce.spark.xd.com/assets/game_material/TRS实况铁路模拟/SCREENSHOT_2026-10-12T05-24-59_02.png",
+      "https://tapcode-sce.spark.xd.com/assets/game_material/TRS实况铁路模拟/SCREENSHOT_2026-10-12T05-25-23_03.png"
+    ],
+    "promotional_image_url": "https://tapcode-sce.spark.xd.com/assets/game_material/m_vx1f/trs_promo_v3_20261012065626.png",
+    "cover_vertical": "./.project/game_material/COVER_VERTICAL_2026-10-12T07-10-01_01.png",
+    "cover_vertical_url": "https://tapcode-sce.spark.xd.com/assets/game_material/TRS实况铁路模拟/COVER_VERTICAL_2026-10-12T07-10-01_01.png",
+    "cover_horizontal": "./.project/game_material/COVER_HORIZONTAL_2026-10-12T07-10-01_01.png",
+    "cover_horizontal_url": "https://tapcode-sce.spark.xd.com/assets/game_material/TRS实况铁路模拟/COVER_HORIZONTAL_2026-10-12T07-10-01_01.png"
   },
   "metadata": {
-    "updated_at": "2026-10-06T13:55:52.075Z"
+    "updated_at": "2026-10-20T12:52:12.236Z",
+    "promo_dependent_hash": "a0e098229dd9c6340d66c7d68d54c74e"
   },
   "test_qrcode": {
-    "url": "https://tapcode-sce.spark.xd.com/qrcode/m_2y9f_1791294951968.png",
-    "generated_at": "2026-10-06T13:55:52.075Z"
+    "url": "https://tapcode-sce.spark.xd.com/qrcode/m_vx1f_1792500732145.png",
+    "generated_at": "2026-10-20T12:52:12.236Z"
   }
 }

@@ -38,15 +38,3 @@ tools/
 urhox-libs/
 AGENTS.md
 CLAUDE.md
-
-# Local working dirs (this project)
-_uploads/
-assets/image/
-.agent/
-.agents/
-.opencode/
-screenshots/
-
-# Validation outputs & runtime save
-.validation/
-railway_autosave_v1.json

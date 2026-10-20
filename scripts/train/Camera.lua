@@ -5,13 +5,14 @@ local Route = require "world.Route"
 local Locomotive = require "train.Locomotive"
 local Train = require "train.Train"
 local CabInterior = require "train.CabInterior"
+local Station = require "world.Station"
 local ThirdPersonCamera = require "urhox-libs.Camera.ThirdPersonCamera"
 
 local Camera = {}
 local CFG = GameConfig.Camera
 local ENVIRONMENT_MASK = 4 -- 站台/站房/雨棚/桥障碍层；轨道细网格、植被及标牌不参与净空射线。
 local EXTERIOR_MASK = 7
-local INTERIOR_MASK = 15
+local INTERIOR_MASK = 14 -- 驾驶舱8 + 外部环境2/4；排除列车外壳1，避免车体穿进驾驶视野
 
 ---@class TrainCameraPreset
 ---@field id string
@@ -41,6 +42,8 @@ local PRESETS = {
     {id="wheels",name="车轮近察",kind="orbit",car="wheel",distance=2.7,height=.80,yaw=90,pitch=5,fov=49},
     {id="trackside",name="轨旁定点",kind="fixed",car="head",distance=0,height=1.9,yaw=0,pitch=0,fov=55},
     {id="platform",name="站台固定",kind="fixed",car="middle",distance=0,height=3.06,yaw=0,pitch=0,fov=64},
+    {id="elevated_platform",name="高架站台",kind="fixed",car="middle",distance=0,height=5.10,yaw=0,pitch=0,fov=64},
+    {id="under_viaduct",name="桥下仰视",kind="fixed",car="middle",distance=0,height=.80,yaw=180,pitch=-18,fov=68},
     {id="track_front",name="前方轨道",kind="track",car="head",distance=0,height=.96,yaw=0,pitch=-2,fov=73},
     {id="distant",name="跟车远景",kind="orbit",car="middle",distance=360,height=2.5,yaw=-75,pitch=28,fov=58},
 }
@@ -84,6 +87,7 @@ local probeAim_ = Vector3.ZERO
 local probeDesired_ = Vector3.ZERO
 local probeSafe_ = 0.0
 local lastPosition_ = Vector3.ZERO
+local lightingFocus_ = Vector3.ZERO
 local lastPositionValid_ = false
 local rayCount_ = 0
 local obstructionLogged_ = false
@@ -244,6 +248,9 @@ end
 
 ---@return Node|nil
 function Camera.GetNode() return node_ end
+-- 照明选择跟随真实可见目标，不用离地数百米的远机位代替站台/道路观察区域。
+---@return Vector3
+function Camera.GetLightingFocus() return lightingFocus_ end
 ---@return Camera|nil
 function Camera.GetCamera() return camera_ end
 ---@return number
@@ -323,8 +330,10 @@ end
 ---@return Vector3, Quaternion, number
 local function carTransform(trainS,car)
     if car then return car.node.worldPosition,car.node.worldRotation,trainS+car.offset end
-    local position,_,yaw = trackSample(trainS)
-    return position,Quaternion(yaw,Vector3.UP),trainS
+    local position,tangent = trackSample(trainS)
+    local rotation = Quaternion()
+    rotation:FromLookRotation(tangent,Vector3.UP)
+    return position,rotation,trainS
 end
 
 ---@param aim Vector3
@@ -336,7 +345,7 @@ local function lockFixed(aim,carS,direction,preset)
     local position,tangent,yaw = trackSample(carS+28*direction)
     local right = Quaternion(yaw,Vector3.UP)*Vector3.RIGHT
     local desired = position-right*8+Vector3(0,preset.height,0)
-    if preset.id=="platform" then
+    if preset.id=="platform" or preset.id=="elevated_platform" then
         local bestS,bestDistance = carS,math.huge
         -- 站台属于固定站场，不把列车所选历史股道当月台位置；从站场Route坐标锁世界机位。
         for _, station in ipairs(Route.GetStations()) do
@@ -346,7 +355,10 @@ local function lockFixed(aim,carS,direction,preset)
         end
         position,tangent,yaw = Route.Sample(bestS)
         right = Quaternion(yaw,Vector3.UP)*Vector3.RIGHT
-        desired = position+right*4.25+Vector3(0,preset.height,0)
+        local lane=require("world.RailNetwork").GetPlayerLane(carS)
+        local platformTop=Station.GetDimensions().platformTopY
+        local heightOffset=preset.id=="elevated_platform" and platformTop+3.66 or preset.height
+        desired = position+right*(lane==1 and 10.4 or -5.4)+Vector3(0,heightOffset,0)
     end
     local anchorAim = position+Vector3(0,preset.height,0)
     -- 仅锁定时做放置净空检查，之后允许列车离开/被建筑遮挡；不能把固定相机拖着追车。
@@ -384,6 +396,7 @@ function Camera.Update(dt,trainS)
         node_.worldRotation = lead.worldRotation*Quaternion(yawOffset_,Vector3.UP)*Quaternion(pitch_,Vector3.RIGHT)
         camera_.nearClip,camera_.viewMask = .045,INTERIOR_MASK
         setFov(preset.fov)
+        lightingFocus_ = node_.worldPosition
         sightDistance_,snap_ = 0,false
         lastPositionValid_ = false
         return
@@ -421,6 +434,7 @@ function Camera.Update(dt,trainS)
         node_:LookAt(aim)
         node_.worldRotation=node_.worldRotation*Quaternion(yawOffset_,Vector3.UP)*Quaternion(pitch_,Vector3.RIGHT)
         setFov(preset.fov)
+        lightingFocus_ = node_.worldPosition
         sightDistance_ = (aim-node_.worldPosition):Length()
         snap_,lastPositionValid_ = false,false
         return
@@ -455,6 +469,8 @@ function Camera.Update(dt,trainS)
         if allowed>=floorY-ground.y then node_.worldPosition=raised end
         node_:LookAt(aim)
     end
+    -- 远景/鸟瞰以视线落点选择有限灯池，近轨机位则围绕眼点。
+    lightingFocus_ = preset.kind=="orbit" and aim or node_.worldPosition
     lastPosition_,lastPositionValid_,snap_ = node_.worldPosition,true,false
 end
 

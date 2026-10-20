@@ -43,8 +43,13 @@ end
 ---@field asset? boolean 使用独立站房资产
 
 local STATION_MODEL="model/91331fcb-7232-52b8-860e-4d22a5a15592/Meshes/c18152abfa1547eabe3c54bb8fae7f09.mdl"
+local CANOPY_MODEL="model/ea12c55a04ce49e7a62e1e952b2b85d0/Meshes/ea12c55a04ce49e7a62e1e952b2b85d0.mdl"
+local CANOPY_DIFFUSE="model/ea12c55a04ce49e7a62e1e952b2b85d0/Textures/ea12c55a04ce49e7a62e1e952b2b85d0_00_D.jpg"
+local CANOPY_NORMAL="model/ea12c55a04ce49e7a62e1e952b2b85d0/Textures/ea12c55a04ce49e7a62e1e952b2b85d0_00_N.png"
 ---@type Material?
 local stationMaterial_=nil
+---@type Material?
+local canopyMaterial_=nil
 ---@return Material
 local function stationMaterial()
     if not stationMaterial_ then
@@ -59,6 +64,32 @@ local function stationMaterial()
     return assert(stationMaterial_)
 end
 
+---@return Material
+local function canopyMaterial()
+    if not canopyMaterial_ then
+        local mat=Material()
+        mat:SetTechnique(0,assert(cache:GetResource("Technique","Techniques/PBR/PBRDiffNormal.xml")))
+        local diffuse=assert(cache:GetResource("Texture2D",CANOPY_DIFFUSE))
+        local normal=assert(cache:GetResource("Texture2D",CANOPY_NORMAL))
+        diffuse:SetSRGB(true);normal:SetSRGB(false)
+        diffuse:SetFilterMode(FILTER_ANISOTROPIC);normal:SetFilterMode(FILTER_ANISOTROPIC)
+        diffuse:SetAnisotropy(4);normal:SetAnisotropy(4)
+        mat:SetTexture(TU_DIFFUSE,diffuse);mat:SetTexture(TU_NORMAL,normal)
+        mat:SetShaderParameter("Metallic",Variant(.42))
+        mat:SetShaderParameter("Roughness",Variant(.68))
+        canopyMaterial_=mat
+    end
+    return assert(canopyMaterial_)
+end
+
+---@return Model,Vector3
+local function canopyAsset()
+    local mesh=assert(cache:GetResource("Model",CANOPY_MODEL),"缺少原创站台雨棚模型")
+    local size=mesh.boundingBox.size
+    assert(size.x>.1 and size.y>.1 and size.z>.1,"雨棚包围盒无效")
+    return mesh, size
+end
+
 ---@return Model,number,Vector3
 local function stationAsset()
     local mesh=assert(cache:GetResource("Model",STATION_MODEL),"缺少星汐独立站房模型")
@@ -71,7 +102,7 @@ end
 --- 每座城市一套原型；体量、材质、屋顶形态都不同。
 ---@type StationStyle[]
 StationBuildings.Styles = {
-    [1] = { archetype = "palace", asset = true, D = 17.0, L = 62.0, H = 8.6,
+    [1] = { archetype = "palace", asset = false, D = 17.0, L = 62.0, H = 8.6,
         body = Color(0.64, 0.29, 0.23), trim = Color(0.90, 0.86, 0.76),
         roof = Color(0.29, 0.19, 0.16), accent = Color(0.86, 0.71, 0.29) },
     [2] = { archetype = "tower", D = 15.0, L = 48.0, H = 7.8,
@@ -86,6 +117,16 @@ StationBuildings.Styles = {
     [5] = { archetype = "terminal", D = 23.0, L = 54.0, H = 8.2,
         body = Color(0.33, 0.37, 0.41), trim = Color(0.75, 0.79, 0.81),
         roof = Color(0.16, 0.20, 0.24), accent = Color(0.32, 0.59, 0.71) },
+    [6] = { archetype="palace",D=14,L=42,H=6.6,
+        body=Color(.73,.66,.48),trim=Color(.88,.86,.72),roof=Color(.24,.34,.29),accent=Color(.49,.59,.33) },
+    [7] = { archetype="gate",D=17,L=46,H=7.6,
+        body=Color(.49,.51,.48),trim=Color(.77,.76,.68),roof=Color(.21,.25,.24),accent=Color(.63,.54,.37) },
+    [8] = { archetype="tower",D=14,L=44,H=8.8,
+        body=Color(.67,.57,.40),trim=Color(.86,.82,.69),roof=Color(.20,.34,.29),accent=Color(.44,.62,.50) },
+    [9] = { archetype="block",D=15,L=50,H=8.0,
+        body=Color(.70,.69,.59),trim=Color(.86,.86,.78),roof=Color(.28,.33,.31),accent=Color(.45,.56,.42) },
+    [10] = { archetype="terminal",D=22,L=58,H=9.2,
+        body=Color(.48,.57,.59),trim=Color(.85,.88,.85),roof=Color(.20,.31,.37),accent=Color(.35,.66,.70) },
 }
 
 ---@param style StationStyle
@@ -353,6 +394,148 @@ local function buildTerminal(node, s, pause)
     for _, b in ipairs({ body, trim, glass, roof, accent }) do b:Finish(); if pause then pause() end end
 end
 
+-- Glazed platform-facing gallery shares the existing building envelope. Historic roof,
+-- clock tower and arcade remain visible behind it; central entrances stay genuinely open.
+-- Front +X is limited to D/2+2.10 (within FootprintRadius's existing 2.2m overhang).
+---@param node Node
+---@param s StationStyle
+---@param pause? fun()
+local function buildReferenceGallery(node,s,pause)
+    local glass = batch(node,"ReferenceStationGlazedGallery",Materials.Glass(Color(.39,.55,.60,.42)),false)
+    local frame = batch(node,"ReferenceStationGlazingMullions",solid(Color(.74,.78,.79),.48,.48),true)
+    local interior = batch(node,"ReferenceGalleryInterior",solid(Color(.35,.39,.40),.16,.82),false)
+    local ceiling = batch(node,"ReferenceGalleryMetalSoffit",solid(Color(.58,.62,.63),.48,.61),true)
+    local front,back = s.D/2+2.10,s.D/2+.24
+    local low,high = .25,math.min(s.H-.8,6.8)
+    local half = s.L/2-1.6
+    -- Three-metre panels, two horizontal rails, real return glazing, door mullions.
+    -- Exclude middle ±4m: no glass panel seals palace/arcade/terminal entrances.
+    for side=-1,1,2 do
+        local first,last = side<0 and -half or 4.2,side<0 and -4.2 or half
+        local count = math.max(1,math.ceil((last-first)/3))
+        local step = (last-first)/count
+        for i=1,count do
+            local z0,z1 = first+(i-1)*step,first+i*step
+            for row=1,3 do
+                local y0,y1 = low+(row-1)*(high-low)/3,low+row*(high-low)/3
+                glass:AddBox(Vector3(front-.035,(y0+y1)/2,(z0+z1)/2),Vector3(.035,y1-y0-.08,z1-z0-.08))
+            end
+            frame:AddBox(Vector3(front,(low+high)/2,z0),Vector3(.085,high-low,.085))
+            -- Narrow interior bench and handrail visible through the glass, behind outer plane.
+            if i%2==0 then
+                interior:AddBox(Vector3(back+.50,.61,(z0+z1)/2),Vector3(.56,.09,step-.5))
+                for _,dz in ipairs({-.70,.70}) do
+                    frame:AddBox(Vector3(back+.50,.33,(z0+z1)/2+dz),Vector3(.35,.52,.045))
+                end
+            end
+        end
+        frame:AddBox(Vector3(front,(low+high)/2,last),Vector3(.085,high-low,.085))
+        for row=0,3 do
+            frame:AddBox(Vector3(front,low+row*(high-low)/3,(first+last)/2),Vector3(.085,.085,last-first))
+        end
+        for _,z in ipairs({first,last}) do
+            glass:AddBox(Vector3((front+back)/2,(low+high)/2,z),Vector3(front-back,high-low,.035))
+            frame:AddBox(Vector3(back,(low+high)/2,z),Vector3(.085,high-low,.085))
+        end
+        ceiling:AddBox(Vector3((front+back)/2,high+.10,(first+last)/2),Vector3(front-back+.12,.12,last-first+.10))
+        interior:AddBox(Vector3((front+back)/2,.13,(first+last)/2),Vector3(front-back,.26,last-first))
+        for z=first,last,.32 do
+            frame:AddBox(Vector3((front+back)/2,high+.025,z),Vector3(front-back,.025,.022))
+        end
+        if pause then pause() end
+    end
+    for _,target in ipairs({glass,frame,interior,ceiling}) do
+        target:Finish();target.geometry.drawDistance=600
+        target.geometry.shadowDistance=100
+        if pause then pause() end
+    end
+end
+
+-- Secondary platform-facing waiting wings. Eight-metre depth, twelve-metre bays:
+-- +X is rail-facing; the near face +4.6 never substitutes for the historic main house.
+-- Real open arcade/glazed recess, with the city's existing roof/stone/brick vocabulary.
+---@param node Node
+---@param style StationStyle
+---@param pause? fun()
+function StationBuildings.BuildPlatformWing(node,style,pause)
+    local masonry=batch(node,"NearLineWingMasonry",World.Textured("NearLineWingWall_"..style.archetype,
+        style.archetype=="palace" and "Textures/Railway/brick.png" or "Textures/Railway/concrete.png",style.body,.94),true,1.4)
+    local trim=batch(node,"NearLineWingPiersAndLintels",solid(style.trim,.06,.87),true)
+    local roof=batch(node,"NearLineWingRoof",solid(style.roof,.16,.76),true)
+    local recess=batch(node,"NearLineWingRecess",solid(Color(.12,.18,.20),.14,.75),false)
+    local glass=batch(node,"NearLineWingGlazing",Materials.Glass(Color(.40,.55,.57,.48)),false)
+    local high=style.archetype=="block" and 8.8 or 7.6
+    -- Opaque backing is 2.4m behind the facade; no glass pasted onto an outer solid box.
+    masonry:AddBox(Vector3(-1.30,high/2,0),Vector3(5.4,high,12))
+    trim:AddBox(Vector3(0,.16,0),Vector3(8,.32,12))
+    recess:AddBox(Vector3(1.43,3.15,0),Vector3(.06,5.7,10.8))
+    for _,z in ipairs({-5.70,0,5.70}) do
+        masonry:AddBox(Vector3(3.88,high/2,z),Vector3(.64,high,.52))
+        trim:AddBox(Vector3(3.88,.36,z),Vector3(.80,.72,.76))
+        trim:AddBox(Vector3(3.88,high-.45,z),Vector3(.86,.36,.82))
+    end
+    if style.archetype=="gate" then
+        -- Hollow two-bay stone arches; no rectangular fake door slab fills the opening.
+        for _,cz in ipairs({-2.85,2.85}) do
+            for segment=1,12 do
+                local a,b=(segment-1)*math.pi/12,segment*math.pi/12
+                local inner,outer=2.57,2.88
+                local i0=Vector3(4.24,3.6+inner*math.sin(a),cz+inner*math.cos(a))
+                local i1=Vector3(4.24,3.6+inner*math.sin(b),cz+inner*math.cos(b))
+                local o0=Vector3(4.24,3.6+outer*math.sin(a),cz+outer*math.cos(a))
+                local o1=Vector3(4.24,3.6+outer*math.sin(b),cz+outer*math.cos(b))
+                trim:AddQuad(i0,i1,o1,o0)
+                local back=Vector3(-.55,0,0)
+                trim:AddQuad(i0+back,o0+back,o1+back,i1+back)
+                trim:AddQuad(i0+back,i1+back,i1,i0)
+            end
+        end
+    else
+        -- Two distinct facade scales: high clerestory / recessed full-height waiting windows.
+        for _,z in ipairs({-2.85,2.85}) do
+            glass:AddBox(Vector3(4.18,3.28,z),Vector3(.035,5.25,5.05))
+            for _,dz in ipairs({-1.68,0,1.68}) do
+                trim:AddBox(Vector3(4.22,3.28,z+dz),Vector3(.10,5.30,.075))
+            end
+        end
+        for _,y in ipairs({.68,3.82,5.93}) do
+            trim:AddBox(Vector3(4.23,y,0),Vector3(.14,.14,11.45))
+        end
+    end
+    trim:AddBox(Vector3(3.90,high-.34,0),Vector3(.80,.56,12))
+    if style.archetype=="palace" or style.archetype=="tower" then
+        local ridge=high+(style.archetype=="palace" and 1.50 or 1.10)
+        roof:AddQuad(Vector3(-4.6,high,-6.12),Vector3(-4.6,high,6.12),Vector3(0,ridge,6.12),Vector3(0,ridge,-6.12))
+        roof:AddQuad(Vector3(0,ridge,-6.12),Vector3(0,ridge,6.12),Vector3(4.6,high,6.12),Vector3(4.6,high,-6.12))
+        for side=-1,1,2 do
+            local z=side*6.02
+            if side<0 then masonry:AddTri(Vector3(-4,high,z),Vector3(0,ridge-.08,z),Vector3(4,high,z))
+            else masonry:AddTri(Vector3(4,high,z),Vector3(0,ridge-.08,z),Vector3(-4,high,z)) end
+        end
+        trim:AddBox(Vector3(0,ridge+.04,0),Vector3(.24,.14,12.3))
+    elseif style.archetype=="terminal" then
+        -- Raised clerestory plus light projecting metal cap, not the palace gable.
+        glass:AddBox(Vector3(4.18,6.82,0),Vector3(.045,.82,11.4))
+        roof:AddBox(Vector3(-.20,high+.10,0),Vector3(8.8,.18,12.3))
+        trim:AddBox(Vector3(4.40,high-.22,0),Vector3(.18,.42,12.3))
+    else
+        roof:AddBox(Vector3(0,high+.10,0),Vector3(8.6,.20,12.3))
+        trim:AddBox(Vector3(4.24,high+.32,0),Vector3(.22,.44,12.3))
+        if style.archetype=="block" then
+            glass:AddBox(Vector3(4.19,7.12,0),Vector3(.05,1.16,11.4))
+            trim:AddBox(Vector3(4.24,7.88,0),Vector3(.15,.16,11.7))
+        end
+    end
+    -- Return glazing is important in approach/oblique views; all materials remain shared.
+    for side=-1,1,2 do
+        glass:AddBox(Vector3(2.85,3.1,side*5.98),Vector3(2.5,4.8,.035))
+    end
+    for _,target in ipairs({masonry,trim,roof,recess,glass}) do
+        target:Finish();target.geometry.drawDistance=720;target.geometry.shadowDistance=120
+        if pause then pause() end
+    end
+end
+
 ---@type table<string, fun(node: Node, style: StationStyle, pause: (fun()|nil))>
 local BUILDERS = {
     palace = buildPalace,
@@ -361,6 +544,29 @@ local BUILDERS = {
     block = buildBlock,
     terminal = buildTerminal,
 }
+
+---@param parent Node
+---@param target Vector3
+---@param yaw number
+---@param targetLength number
+---@param name string
+---@return Node
+function StationBuildings.BuildCanopyModule(parent,target,yaw,targetLength,name)
+    local mesh,size=canopyAsset()
+    local box=mesh.boundingBox
+    local horizontal=math.max(size.x,size.z)
+    local scale=targetLength/math.max(.1,horizontal)
+    local rotation=Quaternion(yaw,Vector3.UP)
+    local node=parent:CreateChild(name)
+    node.position=target-rotation*Vector3(box.center.x*scale,box.min.y*scale,box.center.z*scale)
+    node.rotation=rotation
+    node.scale=Vector3.ONE*scale
+    local drawable=node:CreateComponent("StaticModel")
+    drawable.model=mesh
+    drawable:SetMaterial(0,canopyMaterial())
+    drawable.viewMask,drawable.castShadows,drawable.shadowDistance,drawable.drawDistance=2,true,140,900
+    return node
+end
 
 --- 在已定位/旋转的节点内构建对应原型的站房几何。
 ---@param node Node
@@ -379,7 +585,7 @@ function StationBuildings.Build(node, style, pause)
         local drawable=house:CreateComponent("StaticModel")
         drawable.model=mesh
         drawable:SetMaterial(0,stationMaterial())
-        drawable.viewMask,drawable.castShadows,drawable.shadowDistance,drawable.drawDistance=6,true,180,1400
+        drawable.viewMask,drawable.castShadows,drawable.shadowDistance,drawable.drawDistance=2,true,180,1400
         -- 模型自带四级 LOD，缓存共享；只有近站一栋，不沿全线复制高面数建筑。
         print("[StationBuildings] 星汐红砖钟楼独立站房接入，旧实心大厅/方柱/拼装屋顶不再构建")
         if pause then pause() end
@@ -387,6 +593,7 @@ function StationBuildings.Build(node, style, pause)
     end
     local builder = BUILDERS[style.archetype] or buildPalace
     builder(node, style, pause)
+    buildReferenceGallery(node,style,pause)
 end
 
 ---@param style StationStyle

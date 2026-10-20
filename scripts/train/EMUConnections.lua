@@ -144,9 +144,11 @@ function Connections.Update(connection)
     for i=0,FOLDS do
         local t = i/FOLDS
         local ring = {} ---@type Vector3[]
+        ---@type Vector3
         local center = (localA[1]+localA[3])*.5+((localB[1]+localB[3])*.5-(localA[1]+localA[3])*.5)*t
         for k=1,4 do
             -- 在连接局部空间插值；69km世界坐标的float会把端环再量化约4mm。
+            ---@type Vector3
             local point = localA[k]+(localB[k]-localA[k])*t
             local bulge = i>0 and i<FOLDS and (i%2==0 and .065 or -.060) or 0
             ring[k] = point+(point-center):Normalized()*bulge

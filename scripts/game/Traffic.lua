@@ -8,9 +8,9 @@
 -- 玩家GetS为头车中心，保守整列包络[s-activeLength,s+16]。
 --
 -- station s:    -700          -320                 +160          +400
--- lane 2         \=========== 站侧线 ============== /                (+10.8m)
+-- lane 2         \=========== 站侧线 ============== /                (-10.8m)
 -- lane 0  --------\---------- 下行正线 ------------/-------------    (0m)
--- lane 1  ======================================================    (-5m)
+-- lane 1  ======================================================    (+5m)
 --                  入口咽喉                         出口咽喉
 -- lane0/lane2咽喉按完整编组锁定；中央平行股道不是同一个排他锁，
 -- 可以真实待避。纵向跟车保留鼻端至前车尾端80m，并计算制动包络。
@@ -22,7 +22,15 @@ local Route = require "world.Route"
 local RailNetwork = require "world.RailNetwork"
 local GameConfig = require "config.GameConfig"
 local Visuals = require "game.TrafficVisuals"
+local GameModes = require "config.GameModes"
+local Rage = require "game.RageEvents"
 local Traffic = {}
+
+-- 普通依旧只克隆当前玩家选定的同一车型；狂暴使用完全独立的交通/物理/池。
+-- 模式只能在重开/重建路线前切换，本模块不热换地图或玩家状态。
+local function rageMode()
+    return GameModes.IsRage() or GameConfig.GameMode == "rage"
+end
 
 local GAP = 80.0
 local AI_LENGTH = 260.0 -- 所有当前八节车型的保守包络，不随换车缩短安全占用
@@ -86,6 +94,8 @@ local SIGNAL_BLOCK = 1600
 ---@field hi number
 ---@field owner string?
 ---@field occupied boolean
+---@field crossing boolean?
+---@field upBypass boolean?
 ---@class TrafficPassing
 ---@field stationIndex number
 ---@field stationS number
@@ -97,6 +107,20 @@ local SIGNAL_BLOCK = 1600
 ---@field exitClearS number
 ---@field dir number
 ---@field startS number
+---@field dispatchReason string
+---@field dispatchAttempts integer
+
+---@class TrafficDepartureStatus
+---@field blocked boolean
+---@field reason string stable machine-readable reason
+---@field message string
+---@field aspect string red|yellow|green
+---@field signalReason string
+---@field stationIndex number
+---@field blockerName string?
+---@field blockerDistance number?
+---@field throatId string?
+---@field passingPhase string?
 
 ---@type TrafficVehicle[]
 local trains_ = {}
@@ -137,7 +161,7 @@ local function lineLength() return math.max(0,Route.GetLength()) end
 local function input()
     if override_ then return override_ end
     return {s=Train.GetS(),speedMs=Train.GetSpeedMs(),length=Train.GetActiveLength(),
-        reversing=Train.IsReversing(),deceleration=Train.GetServiceDeceleration(),
+        reversing=Train.IsReversing(),deceleration=Train.GetServiceDeceleration(true),
         operatingKmh=Train.GetOperatingSpeedKmh()}
 end
 
@@ -201,6 +225,7 @@ end
 ---@return integer
 local function laneAt(a,s)
     if a.player then return playerLane(s) end
+    if RailNetwork.GetPathLane then return RailNetwork.GetPathLane(s,a.lane) end
     if a.lane == 2 and not yard(s) then return 0 end
     return a.lane
 end
@@ -210,22 +235,23 @@ end
 ---@param s number
 ---@return boolean
 local function sharesTrack(a,b,s)
-    local left, right = laneAt(a,s),laneAt(b,s)
-    if left == right then return true end
-    if left == 1 or right == 1 then return false end
-    local station = yard(s)
-    if not station then return true end
-    local relative = s-station.s
-    -- 全扇区视为共享咽喉，不能仅因鼻端已经分流就允许
-    -- 车身仍处在低横向间隔处与另一整列相互穿透。
-    return relative <= -320+10 or relative >= 160-10
+    local left,right=laneAt(a,s),laneAt(b,s)
+    -- 包括新增1↔5上行绕行和3/4渡线；编号不同不代表同股或异股。
+    -- 用所有车体/钢轨共用的真实横距，避免lane5被旧0/2兜底误当下行线。
+    return math.abs(RailNetwork.GetLateral(s,left)-RailNetwork.GetLateral(s,right))<3.5
 end
 
 ---@param a TrafficActor
 ---@param throat TrafficThroat
 ---@return boolean
 local function usesThroat(a,throat)
-    return laneAt(a,(throat.lo+throat.hi)*.5) ~= 1
+    if throat.crossing then
+        local cross=RailNetwork.GetTurnback()
+        return cross~=nil and cross.stationIndex==throat.stationIndex
+    end
+    local lane=laneAt(a,(throat.lo+throat.hi)*.5)
+    if throat.upBypass then return lane==1 or lane==5 end
+    return lane~=1 and lane~=5
 end
 
 ---@param a TrafficActor
@@ -245,6 +271,26 @@ local function entryDistance(a,lo,hi)
     return a.dir > 0 and lo-a.headS or a.headS-hi
 end
 
+-- 分段切点包含上下行真实样条；细分咽喉可检出仅车尾侵入另一股的限界。
+---@param cuts number[]
+---@param lo number
+---@param hi number
+local function routeCuts(cuts,lo,hi)
+    for _,station in ipairs(stations_) do
+        local routing=RailNetwork.GetStationRouting and RailNetwork.GetStationRouting(station.index) or nil
+        local points={station.s-710,station.s-310,station.s+150,station.s+410}
+        if routing then
+            points={routing.first,routing.plateauFirst,routing.plateauLast,routing.last}
+            if routing.up then
+                for _,point in ipairs({routing.up.first,routing.up.plateauFirst,routing.up.plateauLast,routing.up.last}) do
+                    points[#points+1]=point
+                end
+            end
+        end
+        for _,point in ipairs(points) do if point>lo and point<hi then cuts[#cuts+1]=point end end
+    end
+end
+
 ---@param a TrafficActor
 ---@param b TrafficActor
 ---@return number gap, number frontSpeed
@@ -253,12 +299,12 @@ local function followingGap(a,b)
     -- 会车不制造纵向冲突，但跨入口/出口的车身仍参与检查。
     if (a.dir > 0 and b.hi < a.headS) or (a.dir < 0 and b.lo > a.headS) then return math.huge,0 end
     local cuts = {b.lo,b.hi} ---@type number[]
-    for _, station in ipairs(stations_) do
-        for _, offset in ipairs({-710,-310,150,410}) do
-            local point = station.s+offset
-            if point > b.lo and point < b.hi then cuts[#cuts+1] = point end
+    for _,cross in ipairs(RailNetwork.GetCrossovers()) do
+        for _,point in ipairs({cross.first,cross.last}) do
+            if point>b.lo and point<b.hi then cuts[#cuts+1]=point end
         end
     end
+    routeCuts(cuts,b.lo,b.hi)
     table.sort(cuts)
     local best = math.huge
     for i = 1,#cuts-1 do
@@ -297,18 +343,38 @@ local function clearedThroat(a,throat)
     return a.dir > 0 and a.lo > throat.hi+margin or a.dir < 0 and a.hi < throat.lo-margin
 end
 
+---@param candidate TrafficActor
+---@param throat TrafficThroat
+---@param all TrafficActor[]
+---@return boolean
+local function queuedBehind(candidate,throat,all)
+    if overlaps(candidate,throat.lo,throat.hi,0) then return false end
+    for _, leader in ipairs(all) do
+        if leader.id ~= candidate.id and leader.dir == candidate.dir and usesThroat(leader,throat)
+            and laneAt(candidate,candidate.headS) == laneAt(leader,leader.headS) then
+            local distance = candidate.dir*(leader.headS-candidate.headS)
+            local atThroat = entryDistance(leader,throat.lo,throat.hi)
+            if distance > 0 and (atThroat >= 0 or overlaps(leader,throat.lo,throat.hi,0)) then return true end
+        end
+    end
+    return false
+end
+
 local function updateLocks()
     local all = actors()
     for _, throat in ipairs(throats_) do
         local owner = throat.owner and findActor(throat.owner) or nil
-        local passingExit = passing_ and not passing_.cleared and throat.stationIndex == 3
+        local cross=RailNetwork.GetTurnback()
+        local reserved=cross and throat.crossing and throat.stationIndex==cross.stationIndex
+        if reserved then throat.owner="player";owner=playerActor() end
+        local passingExit = passing_ and not passing_.cleared and passing_.phase ~= "cancelled" and throat.stationIndex == 3
             and throat.side == (passing_.dir > 0 and "exit" or "entry")
         if owner and owner.player and passingExit and not overlaps(owner,throat.lo,throat.hi,0) then
             throat.owner,throat.occupied,owner = nil,false,nil
         end
-        if owner then
+        if owner and not reserved then
             local distance = entryDistance(owner,throat.lo,throat.hi)
-            if not usesThroat(owner,throat) or clearedThroat(owner,throat)
+            if not usesThroat(owner,throat) or clearedThroat(owner,throat) or queuedBehind(owner,throat,all)
                 or (not overlaps(owner,throat.lo,throat.hi,GAP)
                     and distance > approachHorizon(owner,AI_BRAKE)+1000) then
                 throat.owner,throat.occupied = nil,false
@@ -326,10 +392,11 @@ local function updateLocks()
                     local distance = entryDistance(candidate,throat.lo,throat.hi)
                     local physical = overlaps(candidate,throat.lo,throat.hi,0)
                     if (physical or (distance >= 0 and distance <= approachHorizon(candidate,AI_BRAKE)))
+                        and not queuedBehind(candidate,throat,all)
                         and not (passingExit and candidate.player and not physical) then
                         local priority = physical and -100000-math.min(candidate.hi-throat.lo,throat.hi-candidate.lo)
                             or distance/math.max(3,candidate.speedMs)
-                        if passing_ and not passing_.cleared and throat.stationIndex == 3 then
+                        if passing_ and not passing_.cleared and passing_.phase ~= "cancelled" and throat.stationIndex == 3 then
                             local entrance = passing_.dir > 0 and "entry" or "exit"
                             if throat.side == entrance and candidate.player and laneAt(candidate,throat.lo+1) == 2 then
                                 priority = priority-10000
@@ -351,12 +418,13 @@ end
 ---@param acceleration number
 ---@return number speedMs, string reason, number hardDistance
 local function authority(a,acceleration)
+    local all = actors()
     local limit,reason,hard = math.huge,"区间畅通",math.huge
     local function apply(value,label,distance)
         if value < limit then limit,reason = value,label end
         if distance then hard = math.min(hard,math.max(0,distance)) end
     end
-    for _, other in ipairs(actors()) do
+    for _, other in ipairs(all) do
         if other.id ~= a.id then
             local gap,frontSpeed = followingGap(a,other)
             if gap < math.huge then
@@ -369,7 +437,9 @@ local function authority(a,acceleration)
         end
     end
     for _, throat in ipairs(throats_) do
-        if usesThroat(a,throat) and throat.owner and throat.owner ~= a.id then
+        local owner = throat.owner and findActor(throat.owner) or nil
+        local queuedOwner = owner and queuedBehind(owner,throat,all) or false
+        if usesThroat(a,throat) and throat.owner and throat.owner ~= a.id and not queuedOwner then
             local distance = entryDistance(a,throat.lo,throat.hi)-GAP
             if distance >= -GAP or overlaps(a,throat.lo,throat.hi,0) then
                 apply(math.sqrt(2*acceleration*math.max(0,distance-a.speedMs*1.5)),
@@ -378,12 +448,17 @@ local function authority(a,acceleration)
         end
     end
     if a.player then
+        if RailNetwork.GetTurnback() then apply(SWITCH_KMH/3.6,"端站连续渡线40km/h",nil) end
         -- 整列通过道岔才解除40km/h；下一已预选的侧线也提前
         -- 计算高速制动包络，不能等鼻端进岔才突然限速。
         for _, station in ipairs(stations_) do
-            local entry = station.s-700
-            local exit = station.s+400
-            if playerLane(station.s) == 2 then
+            local routing=RailNetwork.GetStationRouting and RailNetwork.GetStationRouting(station.index) or nil
+            local selectedLane=playerLane(station.s)
+            local upSelected=routing and playerLane((routing.up.first+routing.up.last)*.5)==5
+            local path=upSelected and routing.up or routing
+            local entry=path and path.first or station.s-700
+            local exit=path and path.last or station.s+400
+            if selectedLane==2 or upSelected then
                 if overlaps(a,entry,exit,0) then
                     apply(SWITCH_KMH/3.6,"侧线道岔40km/h",nil)
                 else
@@ -396,7 +471,7 @@ local function authority(a,acceleration)
                 end
             end
         end
-        if passing_ and not passing_.cleared and service_ == "passing" and a.dir == passing_.dir
+        if passing_ and not passing_.cleared and passing_.phase ~= "cancelled" and service_ == "passing" and a.dir == passing_.dir
             and playerLane(passing_.stationS) == 2 then
             -- 待避停车界位于出站汇合扇区之前，不阻止合法进入站台。
             local stop = passing_.stationS+(a.dir > 0 and 160-GAP or -320+GAP)
@@ -422,7 +497,7 @@ local function authority(a,acceleration)
 end
 
 local function updatePassing()
-    if not passing_ or passing_.cleared or service_ ~= "passing" then return end
+    if not passing_ or passing_.cleared or passing_.phase == "cancelled" or service_ ~= "passing" then return end
     local express = findTrain(passing_.trainId)
     if not express then return end
     local player = playerActor()
@@ -533,13 +608,76 @@ local function localStop(train,dt)
     end
 end
 
+---@param train TrafficVehicle
+---@return boolean, string
+local function dispatchQueuedPassing(train)
+    if not passing_ or passing_.trainId ~= train.id or passing_.phase == "cancelled"
+        or train.active or train.visible or train.state ~= "queued" then return false,"not_queued" end
+    local player = playerActor()
+    local stop = passing_.stationS+(train.dir > 0 and -700-GAP or 400+GAP)
+    local low,high = 20+train.length,lineLength()-20-train.length
+    -- 结构上完全容不下一整列的后方进路，才可取消未发出的任务。
+    -- 暂时被另一列占用绝不是取消依据，更不能用超时冒充清尾。
+    local lastHead = train.dir > 0 and math.min(player.lo-REMOTE,stop) or math.max(player.hi+REMOTE,stop)
+    if (train.dir > 0 and lastHead < low) or (train.dir < 0 and lastHead > high) then
+        passing_.phase,passing_.dispatchReason = "cancelled","no_dispatch_corridor"
+        train.state,train.holdReason = "not_dispatched","后方无完整且不可见的安全出库走廊，本次训练取消"
+        print("[Traffic] 待避取消（未发出、未清尾、不计完成）：后方无完整不可见出库走廊 "..train.id)
+        return false,"no_dispatch_corridor"
+    end
+    -- 新班次只能从玩家后方不可见区域安全出库，不能把任何active/visible
+    -- 车重排到站前。遍历确定性候选，避免固定端点被占导致永久排队。
+    local nearest = train.dir > 0 and math.min(player.lo-REMOTE,stop) or math.max(player.hi+REMOTE,stop)
+    local reason = "dispatch_occupied"
+    for offset = 0,lineLength(),train.length+GAP do
+        local head = nearest-train.dir*offset
+        if head >= low and head <= high then
+            local candidate = {id=train.id,dir=train.dir,headS=head,
+                lo=train.dir > 0 and head-train.length or head,
+                hi=train.dir > 0 and head or head+train.length,
+                speedMs=0,lane=train.lane,player=false,length=train.length} --[[@as TrafficActor]]
+            local safe = not overlaps(player,candidate.lo,candidate.hi,REMOTE-1)
+            for _, other in ipairs(actors()) do
+                if other.id ~= train.id then
+                    local sameTrack = sharesTrack(candidate,other,(math.max(candidate.lo,other.lo)+math.min(candidate.hi,other.hi))*.5)
+                    local reaction = other.speedMs*2+other.speedMs*other.speedMs/(2*AI_BRAKE)
+                    if sameTrack and overlaps(other,candidate.lo,candidate.hi,GAP+reaction) then safe = false end
+                    -- 不把新车塞在相向列车的前方制造无可回避的同股对峙。
+                    local between = train.dir > 0 and other.hi >= head and other.lo <= passing_.exitClearS
+                        or train.dir < 0 and other.lo <= head and other.hi >= passing_.exitClearS
+                    if sameTrack and other.dir ~= train.dir and between then
+                        safe,reason = false,"dispatch_opposing"
+                    end
+                end
+            end
+            if safe then
+                train.headS,train.speedMs,train.active,train.state = head,0,true,"running"
+                passing_.dispatchReason = "dispatched"
+                hull(train)
+                print(string.format("[Traffic] 待避快车%s从后方不可见安全空档%.1fm实际发出；仍须真实清尾",train.id,head))
+                return true,"dispatched"
+            end
+        end
+    end
+    passing_.dispatchReason = reason
+    return false,reason
+end
+
 ---@param dt number
 local function step(dt)
     elapsed_,logicSteps_ = elapsed_+dt,logicSteps_+1
+    if passing_ and passing_.phase ~= "cancelled" then
+        local queued = findTrain(passing_.trainId)
+        -- 每模拟秒重查真实空档；计时只控制查询频率，从不开放信号。
+        if queued and queued.state == "queued" and math.floor(elapsed_) >= passing_.dispatchAttempts then
+            passing_.dispatchAttempts = math.floor(elapsed_)+1
+            dispatchQueuedPassing(queued)
+        end
+    end
     updatePassing()
     updateLocks()
     for _, train in ipairs(trains_) do
-        if train.state == "queued" then
+        if train.state == "queued" and (not passing_ or train.id ~= passing_.trainId) then
             local player = playerActor()
             local head = train.dir > 0 and 20+train.length or lineLength()-20-train.length
             local candidate = {id=train.id,dir=train.dir,headS=head,
@@ -614,6 +752,11 @@ end
 ---@param s? number only AI schedule origin; never writes the player's train
 function Traffic.Reset(s)
     Visuals.Reset()
+    if rageMode() then
+        trains_,throats_,stations_,passing_ = {},{},Route.GetStations(),nil
+        Rage.Reset(s or input().s,input().length or Train.GetActiveLength())
+        return
+    end
     trains_,throats_,stations_ = {},{},Route.GetStations()
     elapsed_,accumulator_,logicSteps_,remoteDispatches_,safeStops_ = 0,0,0,0,0
     passing_,lastAspect_,lastConstraint_ = nil,"",""
@@ -621,10 +764,29 @@ function Traffic.Reset(s)
     local first = Train.GetCars()[1]
     sourceFront_ = first and first.length*.5 or 16
     for _, station in ipairs(stations_) do
+        local routing=RailNetwork.GetStationRouting and RailNetwork.GetStationRouting(station.index) or nil
         throats_[#throats_+1] = {id=tostring(station.index).."_entry",stationIndex=station.index,
-            name=station.name,side="entry",lo=station.s-700,hi=station.s-320,occupied=false}
+            name=station.name,side="entry",lo=routing and routing.first or station.s-700,
+            hi=routing and routing.plateauFirst or station.s-320,occupied=false}
         throats_[#throats_+1] = {id=tostring(station.index).."_exit",stationIndex=station.index,
-            name=station.name,side="exit",lo=station.s+160,hi=station.s+400,occupied=false}
+            name=station.name,side="exit",lo=routing and routing.plateauLast or station.s+160,
+            hi=routing and routing.last or station.s+400,occupied=false}
+        if routing and routing.up then
+            local up=routing.up
+            throats_[#throats_+1]={id=station.index.."_up_entry",stationIndex=station.index,
+                name=station.name.."上行绕行",side="entry",lo=up.plateauLast,hi=up.last,
+                occupied=false,upBypass=true}
+            throats_[#throats_+1]={id=station.index.."_up_exit",stationIndex=station.index,
+                name=station.name.."上行绕行",side="exit",lo=up.first,hi=up.plateauFirst,
+                occupied=false,upBypass=true}
+        end
+    end
+    for _,cross in ipairs(RailNetwork.GetCrossovers()) do
+        throats_[#throats_+1]={id="cross_"..cross.lane,stationIndex=cross.stationIndex,
+            name="端站双正线渡线",side="crossover",
+            lo=cross.dir<0 and cross.first or stations_[cross.stationIndex].s-700,
+            hi=cross.dir<0 and stations_[cross.stationIndex].s+440 or cross.last,
+            occupied=false,crossing=true}
     end
     local origin = s or input().s
     local length = lineLength()
@@ -649,6 +811,16 @@ function Traffic.Reset(s)
         spawn("T0"..tostring(i+1),dir > 0 and "express" or "opposing",at,dir,
             dir > 0 and 0 or 1,dir > 0 and 165 or 145,dir > 0 and 110 or 100)
     end
+    local crossing=RailNetwork.GetTurnback()
+    if crossing then
+        -- 排除完整端站调车包络内的新发班次；不能在已锁渡线路径上离线生成。
+        local st=Route.GetStations()[crossing.stationIndex]
+        for _,train in ipairs(trains_) do
+            if train.active and train.hi>=crossing.first-GAP and train.lo<=st.s+440+GAP then
+                train.active,train.state,train.speedMs=false,"not_dispatched",0
+            end
+        end
+    end
     local service = service_
     service_ = "local"
     if service ~= "local" then Traffic.SetService(service) end
@@ -656,16 +828,37 @@ function Traffic.Reset(s)
     print(string.format("[Traffic] 重置：%d个全线逻辑班次，最多3个可见8节编组；最小尾距80m",#trains_))
 end
 
+function Traffic.SetVisualQuality(qualityId)
+    if rageMode() then return end
+    Visuals.SetQuality(qualityId)
+end
+
 ---@param scene Scene|nil nil: logic-only mode, no engine scene or assets created
 function Traffic.Init(scene)
-    Visuals.Init(scene)
+    if rageMode() then Visuals.Init(nil);Rage.Init(scene)
+    else Visuals.Init(scene);Rage.Init(nil) end
     initialized_ = true
+    RailNetwork.SetTurnbackValidator(function(cross,s,length)
+        if rageMode() then return true,"狂暴自由进路" end
+        -- 先检查目标正线完整端站调车区，再锁定连续进路；不向迎面车释放已占用股道。
+        local lo,hi=math.min(cross.first,s-length)-GAP,math.max(cross.last,s+16)+GAP
+        for _,train in ipairs(trains_) do
+            if train.active and train.hi>=lo and train.lo<=hi then return false,"端站折返进路有车占用，请停稳等待" end
+        end
+        for _,throat in ipairs(throats_) do
+            if throat.crossing and throat.stationIndex==cross.stationIndex and throat.owner and throat.owner~="player" then
+                return false,"渡线进路已被来车锁定，请等待列车清尾"
+            end
+        end
+        return true,""
+    end)
     Traffic.Reset()
 end
 
 ---@param dt number
 function Traffic.Update(dt)
     if not initialized_ or dt <= 0 or dt ~= dt then return end
+    if rageMode() then Rage.Update(dt,input());return end
     -- 大卡顿最多推进1秒/50个确定性小步，丢弃多余墙钟时间
     -- 而不是跳跃大量位移跨过玩家或咽喉。
     accumulator_ = accumulator_+math.min(dt,1)
@@ -677,6 +870,7 @@ end
 ---@param dt number
 function Traffic.UpdateVisuals(dt)
     if not initialized_ then return end
+    if rageMode() then Rage.UpdateVisuals(dt);return end
     -- 换车时Train显式Dispose的identity/gangway已从克隆移除；
     -- 剩余模型/材质为普通共享引用，不会误释放玩家cache资源。
     local first = Train.GetCars()[1]
@@ -691,7 +885,9 @@ function Traffic.UpdateVisuals(dt)
 end
 
 function Traffic.Shutdown()
+    RailNetwork.SetTurnbackValidator(nil)
     Visuals.Shutdown()
+    Rage.Shutdown()
     initialized_,trains_,throats_,stations_,passing_,override_ = false,{},{},{},nil,nil
     service_,accumulator_ = "local",0
 end
@@ -699,6 +895,7 @@ end
 ---@return number km/h
 ---@return string
 function Traffic.GetSpeedConstraint()
+    if rageMode() then return math.huge,"狂暴自由驾驶 · 碰撞不处罚" end
     if not initialized_ then return math.huge,"交通未初始化" end
     local data = input()
     local limit,reason = authority(playerActor(),math.max(.1,data.deceleration or .65))
@@ -713,6 +910,7 @@ end
 ---@return number metres to leading nose/tail HARD boundary, math.huge if none
 ---@return string
 function Traffic.GetSafetyDistance()
+    if rageMode() then return math.huge,"狂暴自由驾驶" end
     if not initialized_ then return math.huge,"交通未初始化" end
     local data = input()
     local _,reason,distance = authority(playerActor(),math.max(.1,data.deceleration or .65))
@@ -733,48 +931,153 @@ function Traffic.GetMovementLimit()
 end
 
 ---@param stationIndex number
----@return string red|yellow|green
-function Traffic.GetSignalAspect(stationIndex)
-    if not initialized_ then return "green" end
+---@return TrafficDepartureStatus
+function Traffic.GetDepartureStatus(stationIndex)
+    local result = {blocked=false,reason="clear",message="前方进路开放",aspect="green",
+        signalReason="clear",stationIndex=stationIndex} --[[@as TrafficDepartureStatus]]
+    if not initialized_ then return result end
+    if rageMode() then
+        result.reason,result.signalReason,result.message="rage","rage","狂暴自由进路 · 无红灯强制停车"
+        return result
+    end
     local station = nil ---@type table|nil
     for _, item in ipairs(stations_) do if item.index == stationIndex then station = item;break end end
-    if not station then return "red" end -- 未知信号采取安全侧禁止放行
-    if passing_ and service_ == "passing" and stationIndex == passing_.stationIndex and not passing_.cleared then return "red" end
+    local function stop(reason,message,blocker,distance,throat)
+        result.blocked,result.reason,result.signalReason,result.message,result.aspect = true,reason,reason,message,"red"
+        result.blockerName,result.blockerDistance,result.throatId = blocker,distance,throat
+        return result
+    end
+    if not station then return stop("no_route","无有效发车进路",nil,nil,nil) end
+    if passing_ and service_ == "passing" and stationIndex == passing_.stationIndex then
+        result.passingPhase = passing_.phase
+        if not passing_.cleared and passing_.phase ~= "cancelled" then
+            local express = findTrain(passing_.trainId)
+            local reason = express and not express.active and "passing_dispatch" or "passing_clearance"
+            return stop(reason,reason == "passing_dispatch" and "待避快车尚未安全发出"
+                or "待避快车尚未整列清空出口",passing_.trainId,nil,nil)
+        end
+    end
     local player = playerActor()
-    local lane = playerLane(station.s)
-    local passOpen = passing_ and passing_.cleared and service_ == "passing" and stationIndex == 3
+    local boundary = station.s+(player.dir > 0 and 400 or -700)
+    -- 只检查领行端前方的进路，而不是把[站-700,站+400]整站设为排他块。
+    -- +dir: 后车==> [玩家尾====鼻] --> [出口岔] --> 区间
+    -- -dir: 区间 <-- [入口岔] <-- [鼻====玩家尾] <==后车
+    -- 后车及其入口锁不能阻断前车释放线路；相向同股、前方合流及整列
+    -- 仍横跨出口的AI必须继续挡红，不因等待时间改变判定。
+    for _, throat in ipairs(throats_) do
+        local ahead = player.dir > 0 and throat.hi >= player.headS or player.dir < 0 and throat.lo <= player.headS
+        local owner = throat.owner and findActor(throat.owner) or nil
+        local queuedOwner = owner and queuedBehind(owner,throat,actors()) or false
+        if throat.stationIndex == stationIndex and ahead and usesThroat(player,throat)
+            and throat.owner and throat.owner ~= "player" and not queuedOwner then
+            return stop("throat_conflict",throat.name.."·"..(throat.side == "entry" and "进站" or "出站").."咽喉占用",
+                throat.owner,math.max(0,entryDistance(player,throat.lo,throat.hi)),throat.id)
+        end
+    end
+    local nearest = math.huge
     for _, train in ipairs(trains_) do
-        if train.active and train.lane ~= 1 then
-            local blockStart = station.s-700
-            local blockEnd = station.s+400+GAP
-            if train.hi >= blockStart and train.lo <= blockEnd then
-                -- 中央平行股道可以会车，入/出口扇区仍按真实
-                -- 包络冲突显示红灯，不能全站默认永久绿灯。
-                if lane == 0 or train.hi >= station.s+150 or train.lo <= station.s-310 then return "red" end
-                if lane == 2 then return "yellow" end
+        if train.active then
+            local gap = followingGap(player,actor(train))
+            if gap < math.huge then
+                local distance = gap+GAP
+                local toBoundary = math.max(0,player.dir*(boundary-player.headS))
+                if gap <= GAP or distance <= toBoundary+GAP
+                    or (train.dir ~= player.dir and distance <= toBoundary+SIGNAL_BLOCK+GAP) then
+                    local opposing = train.dir ~= player.dir
+                    return stop(opposing and "opposing_traffic" or "occupied_ahead",
+                        opposing and "前方同股相向列车占用" or "前方列车占用发车进路",train.id,distance,nil)
+                end
+                if distance <= toBoundary+SIGNAL_BLOCK+GAP and distance < nearest then
+                    nearest = distance
+                    result.aspect,result.reason,result.signalReason,result.message = "yellow","caution","occupied_downstream","前方区间有车，限速运行"
+                    result.blockerName,result.blockerDistance = train.id,distance
+                end
             end
         end
     end
-    for _, throat in ipairs(throats_) do
-        if throat.stationIndex == stationIndex and throat.owner and throat.owner ~= "player" then return "red" end
+    if result.aspect == "green" and playerLane(station.s) == 2 then
+        result.aspect,result.reason,result.signalReason,result.message = "yellow","caution","siding_route","侧线进路开放，道岔40km/h"
     end
-    for _, train in ipairs(trains_) do
-        if train.active and train.lane ~= 1 then
-            local downstream = player.dir > 0 and train.lo-(station.s+400) or station.s-700-train.hi
-            if downstream >= 0 and downstream <= SIGNAL_BLOCK
-                and (not passOpen or not passing_ or train.id ~= passing_.trainId) then return "yellow" end
+    return result
+end
+
+-- 独立闭塞信号：设施传入实际股道/方向/里程，不消费玩家整站发车色。
+-- 当前块占用=红，下一块占用=黄；非正常方向只在已锁端站调车范围获得黄灯。
+---@param s number
+---@param lane integer
+---@param dir integer
+---@return string
+function Traffic.GetBlockSignalAspect(s,lane,dir)
+    if not initialized_ or type(s)~="number" or s~=s or s<0 or s>lineLength()
+        or (lane~=0 and lane~=1 and lane~=2 and lane~=5) or (dir~=1 and dir~=-1) then return "red" end
+    local cross=RailNetwork.GetTurnback()
+    local reverseAuthority=cross and dir==cross.dir and s>=cross.first-80
+        and s<=Route.GetStations()[cross.stationIndex].s+440
+    if dir~=RailNetwork.GetNormalDirection(lane) and not reverseAuthority then return "red" end
+    local probe={id="signal",dir=dir,headS=s,lo=s,hi=s,speedMs=0,lane=lane,player=false,length=0}
+        --[[@as TrafficActor]]
+    local function occupied(first,last)
+        local lo,hi=math.min(first,last),math.max(first,last)
+        for _,other in ipairs(actors()) do
+            local a,b=math.max(lo,other.lo),math.min(hi,other.hi)
+            if b>=a then
+                -- 整列可同时覆盖旧股/连续渡线/新股；不能用整段中点代表所有车体。
+                -- 与followingGap采用相同拓扑边界，并检查分段端点：渡线横距在段内
+                -- 单调，哪怕仅尾端刚侵入另一股限界也必须保持红灯。
+                local cuts={a,b}
+                for _,crossing in ipairs(RailNetwork.GetCrossovers()) do
+                    for _,point in ipairs({crossing.first,crossing.last}) do
+                        if point>a and point<b then cuts[#cuts+1]=point end
+                    end
+                end
+                routeCuts(cuts,a,b)
+                table.sort(cuts)
+                for i=1,#cuts-1 do
+                    local firstCut,lastCut=cuts[i],cuts[i+1]
+                    if sharesTrack(probe,other,firstCut) or sharesTrack(probe,other,lastCut)
+                        or sharesTrack(probe,other,(firstCut+lastCut)/2) then return true end
+                end
+            end
+        end
+        return false
+    end
+    local nextS=clamp(s+dir*SIGNAL_BLOCK,0,lineLength())
+    if math.abs(nextS-s)<.1 or occupied(s,nextS) then return "red" end
+    for _,throat in ipairs(throats_) do
+        if throat.owner and usesThroat(probe,throat) then
+            local distance=dir>0 and throat.lo-s or s-throat.hi
+            if distance>=0 and distance<SIGNAL_BLOCK then
+                local owner=findActor(throat.owner)
+                if owner and (owner.dir~=dir or laneAt(owner,(throat.lo+throat.hi)/2)~=lane) then return "red" end
+            end
         end
     end
-    return passOpen and "green" or (lane == 2 and "yellow" or "green")
+    if passing_ and not passing_.cleared and passing_.phase~="cancelled" and lane==2
+        and dir==passing_.dir and math.abs(s-passing_.stationS)<1100 then return "red" end
+    if occupied(nextS,clamp(nextS+dir*SIGNAL_BLOCK,0,lineLength())) or lane==2 or lane==5 or reverseAuthority then return "yellow" end
+    return "green"
+end
+
+---@param stationIndex number
+---@return string red|yellow|green
+function Traffic.GetSignalAspect(stationIndex)
+    return Traffic.GetDepartureStatus(stationIndex).aspect
 end
 
 ---@return table {aspect,text,track,switchText,locked,objective?}
 function Traffic.GetStatus()
+    if rageMode() then
+        local base=RailNetwork.GetStatus()
+        local stats=Rage.GetStats()
+        return {aspect="green",text=stats.eventText,track=base.track,
+            switchText=base.switchText,locked=base.locked,rageStats=stats,
+            nextSwitch=base.nextSwitch,hasNextSwitch=base.hasNextSwitch}
+    end
     local base = RailNetwork.GetStatus()
     local player = playerActor()
     local _,reason,hard = authority(player,math.max(.1,input().deceleration or .65))
     local aspect = "green"
-    if hard <= GAP or (passing_ and not passing_.cleared and service_ == "passing"
+    if hard <= GAP or (passing_ and not passing_.cleared and passing_.phase ~= "cancelled" and service_ == "passing"
         and math.abs(input().s-passing_.stationS) <= 1100) then aspect = "red"
     elseif hard <= SIGNAL_BLOCK or reason:find("40km/h",1,true) then aspect = "yellow" end
     local locked = base.locked
@@ -783,23 +1086,29 @@ function Traffic.GetStatus()
     end
     local objective = nil ---@type string|nil
     if passing_ and service_ == "passing" then
-        objective = passing_.cleared and "快车整列驶离出口，出站进路已开放"
+        objective = passing_.phase == "cancelled" and "待避班次未发出：本次训练取消，仍按真实进路离站"
+            or (passing_.cleared and "快车整列驶离出口，出站进路已开放"
             or (passing_.committed and "侧线待避：快车通过中，等尾车驶离出口"
-                or "站3整列进侧线并停稳，等待快车通过")
+                or "站3整列进侧线并停稳，等待快车通过"))
     end
     if aspect ~= lastAspect_ then
         lastAspect_ = aspect
         print("[Traffic] 车载交通提示 " .. aspect .. " · " .. reason)
     end
     return {aspect=aspect,text=aspect == "green" and "前方进路开放" or reason,
-        track=player.lane == 1 and "上行正线" or (player.lane == 2 and "站内到发线" or "下行正线"),
-        switchText=base.switchText,locked=locked,objective=objective}
+        track=player.lane==5 and "上行绕行线" or (player.lane == 1 and "上行正线" or (player.lane == 2 and "站内到发线" or "下行正线")),
+        switchText=base.switchText,locked=locked,objective=objective,
+        nextSwitch=base.nextSwitch,hasNextSwitch=base.hasNextSwitch}
 end
 
 ---@param service string local|express|passing
 ---@return boolean, string
 function Traffic.SetService(service)
+    if rageMode() then service_="rage";return true,"狂暴自由驾驶 · 无强制待避" end
     if service ~= "local" and service ~= "express" and service ~= "passing" then return false,"未知运营任务" end
+    if service=="passing" and playerActor().dir<0 then
+        return false,"上行无待避到发线：本任务仅下行，不能逆股运行冒充左行"
+    end
     service_ = service
     if service ~= "passing" then
         -- 更换任务不能删除或传送已经发出的快车。
@@ -844,7 +1153,19 @@ function Traffic.SetService(service)
     end
     passing_ = {stationIndex=3,stationS=station.s,trainId=id,phase="approach",cleared=false,
         sidingReady=false,committed=false,exitClearS=station.s+(player.dir > 0 and 400+GAP or -700-GAP),
-        dir=player.dir,startS=player.headS}
+        dir=player.dir,startS=player.headS,dispatchReason=train.active and "dispatched" or "queued",dispatchAttempts=0}
+    -- 不能在同股相向车与站场之间发出一列无处会让的快车。
+    if train.active then
+        for _, other in ipairs(actors()) do
+            local between = train.dir > 0 and other.hi >= train.headS and other.lo <= passing_.exitClearS
+                or train.dir < 0 and other.lo <= train.headS and other.hi >= passing_.exitClearS
+            if other.id ~= id and other.dir ~= train.dir and between
+                and sharesTrack(actor(train),other,other.headS) then
+                train.active,train.state,train.speedMs = false,"queued",0
+                passing_.dispatchReason = "dispatch_opposing"
+            end
+        end
+    end
     print(string.format("[Traffic] 站3待避：后方快车%s已安排，出口需真实尾端>%.1fm才放行",id,passing_.exitClearS))
     return true,"站3待避快车已安排；请预选侧线，整列停稳后等红变绿"
 end
@@ -862,7 +1183,9 @@ end
 
 -- 实际车体包络相交才判撞车，不把80m建议间隔当碰撞或自动停车线。
 function Traffic.CheckPlayerCollision()
-    if not initialized_ or Train.IsDerailed() then return end
+    if not initialized_ then return end
+    if rageMode() then Rage.CheckPlayerCollision(input());return end
+    if Train.IsDerailed() then return end
     local playerCars=Train.GetCars()
     for _,train in ipairs(trains_) do
         if train.active then
@@ -885,6 +1208,7 @@ function Traffic.CheckPlayerCollision()
 end
 ---@return table[] 只读快照，不返回内部对象
 function Traffic.GetTrains()
+    if rageMode() then return Rage.GetTrains() end
     local out = {}
     for _, train in ipairs(trains_) do
         out[#out+1] = {id=train.id,type=train.type,dir=train.dir,lane=train.lane,headS=train.headS,s=train.s,
@@ -897,6 +1221,12 @@ end
 
 ---@return table
 function Traffic.GetStats()
+    if rageMode() then
+        local stats=Rage.GetStats()
+        stats.initialized,stats.service,stats.minHeadway=initialized_,"rage",0
+        stats.occupiedThroats,stats.locks,stats.remoteDispatches,stats.hardSafetyStops=0,{},0,0
+        return stats
+    end
     local visual = Visuals.GetStats()
     local active,held,occupied,locks = 0,0,0,{}
     for _, train in ipairs(trains_) do
@@ -913,6 +1243,8 @@ function Traffic.GetStats()
         local train = findTrain(passing_.trainId)
         pass = {stationIndex=3,trainId=passing_.trainId,phase=passing_.phase,
             cleared=passing_.cleared,sidingReady=passing_.sidingReady,committed=passing_.committed,
+            dispatchReason=passing_.dispatchReason,cancelled=passing_.phase == "cancelled",
+            active=train and train.active or false,
             tailS=train and (passing_.dir > 0 and train.lo or train.hi) or nil,
             headS=train and train.headS or nil,exitClearS=passing_.exitClearS,dir=passing_.dir}
     end
@@ -922,6 +1254,25 @@ function Traffic.GetStats()
         errors=visual.errors,error=visual.error,
         elapsed=elapsed_,logicSteps=logicSteps_,occupiedThroats=occupied,locks=locks,
         remoteDispatches=remoteDispatches_,hardSafetyStops=safeStops_,minHeadway=GAP,passing=pass}
+end
+
+-- 狂暴HUD与存档只读接入；普通模式不暴露抛飞/计分系统。
+---@return table?
+function Traffic.GetRageStats() return rageMode() and Rage.GetStats() or nil end
+---@return table[]
+function Traffic.GetRageCars() return rageMode() and Rage.GetCars() or {} end
+---@return RageImpactEvent[]
+function Traffic.GetImpactEvents() return rageMode() and Rage.GetImpactEvents() or {} end
+---@param maxCount number?
+---@return RageImpactEvent[]
+function Traffic.DrainImpactEvents(maxCount) return rageMode() and Rage.DrainImpactEvents(maxCount) or {} end
+---@return table?
+function Traffic.ExportRageState() return rageMode() and Rage.ExportState() or nil end
+---@param data table?
+---@return boolean,string
+function Traffic.RestoreRageState(data)
+    if not rageMode() then return true,"普通交通不恢复狂暴统计" end
+    return Rage.RestoreState(data)
 end
 
 return Traffic

@@ -7,6 +7,7 @@ local startGame, updateGame, postGame, stopGame = Start, HandleUpdate, HandlePos
 local Route = require "world.Route"
 local Rail = require "world.RailNetwork"
 local Train = require "train.Train"
+local Coach = require "train.Coach"
 local Game = require "game.Game"
 local Traffic = require "game.Traffic"
 local Passenger = require "game.PassengerService"
@@ -23,12 +24,12 @@ local UI = require "urhox-libs/UI"
 local V = {checks=0,cases=0,phases={},logicStatus="NOT_RUN",backgroundDraws=0,backgroundAlpha=-1}
 V.MainStart,V.MainUpdate,V.MainPost,V.MainStop=startGame,updateGame,postGame,stopGame
 V.Trains={
-    {id="blue_white",name="沧羽 D12",horn="audio/sfx/fantasy/horn_d12.mp3"},
-    {id="DF4D",name="赤峦 D18",horn="audio/sfx/fantasy/horn_d18.mp3"},
-    {id="SS9G",name="苍穹 E21",horn="audio/sfx/fantasy/horn_e21.mp3"},
-    {id="HXD3D",name="雷隼 E32",horn="audio/sfx/fantasy/horn_e32.mp3"},
-    {id="CRH380A",name="流萤 M30",horn="audio/sfx/fantasy/horn_m30.mp3"},
-    {id="CR400AF",name="星澜 M35",horn="audio/sfx/fantasy/horn_m35.mp3"},
+    {id="blue_white",name="沧羽 D12",horn="audio/sfx/comfort/comfort_horn_d12.wav"},
+    {id="DF4D",name="赤峦 D18",horn="audio/sfx/comfort/comfort_horn_d18.wav"},
+    {id="SS9G",name="苍穹 E21",horn="audio/sfx/comfort/comfort_horn_e21.wav"},
+    {id="HXD3D",name="雷隼 E32",horn="audio/sfx/comfort/comfort_horn_e32.wav"},
+    {id="CRH380A",name="流萤 M30",horn="audio/sfx/comfort/comfort_horn_m30.wav"},
+    {id="CR400AF",name="星澜 M35",horn="audio/sfx/comfort/comfort_horn_m35.wav"},
 }
 V.Stations={"星汐总站","岚港站","榆岑站","镜澜站","云湾总站"}
 ---@type Scene?
@@ -299,8 +300,14 @@ function V.CheckDoorPlan(plan,lane)
         V.Check(door.clear.y>=plan.platformY and door.clear.y<=plan.platformY+.08,"候车脚点不在实际站台顶面")
         V.Check((door.position-door.edge):Length()<1.0,"乘客门位跨越另一条运营轨")
         local car=assert(cars[door.carIndex])
-        V.Check(car.profile=="coach" or door.source=="simulated_flat_end_vestibule",
-            "未实测EMU门位冒充真实资产门；机车不可乘降")
+        local independent=door.source=="simulated_coach_end_vestibule"
+            and door.carIndex>1 and car.profile==Coach.GetIndependentProfile(Train.GetSelectedId())
+        V.Check(car.profile=="coach" or door.source=="simulated_flat_end_vestibule" or independent,
+            "未实测门位冒充真实资产门或独立客车profile错误；机车不可乘降")
+        if independent then
+            V.Check(car.drawable~=nil and car.assetNode~=nil and Train.ValidateBindings(),
+                "独立客车模拟玄关缺少实际成品绑定")
+        end
         if door.source=="simulated_flat_end_vestibule" then
             V.Check(car.frontEnd~=nil or car.rearEnd~=nil,"模拟门没有实测平端参考")
         end
@@ -361,7 +368,10 @@ local function finishBoarding(trace,requireAllDoors)
     local doorCount=#plan.doors
     -- 同一door同一kind串行服务：每人实际剩余路径/speed相加，门间并行取max。
     -- 先下后上两相位相加，再加真实1.6s关门及离散步误差。不是盲放大到90s。
-    local boarding,alighting={},{}
+    ---@type table<number, number>
+    local boarding={}
+    ---@type table<number, number>
+    local alighting={}
     for _,actor in ipairs(Passenger.GetPassengers()) do
         if not actor.completed then
             V.Check(actor.speed>0,"队列步速为0，不能用更长预算掩盖deadlock")
@@ -557,25 +567,24 @@ local function audioChecks()
         local idle=V.CheckAudioLoops()
         V.Check(idle.trainId==train.id and idle.trainName==train.name and idle.hornPath==train.horn,"音频车型身份不同步")
         local horn=assert(cache:GetResource("Sound",train.horn)) --[[@as Sound]]
-        V.Check(horn:GetLength()>.2 and horn:GetLength()<12 and horn:GetDataSize()>1000,"真实horn MP3没有有效长度/解码数据")
-        V.Near(horn:GetFrequency(),48000,1,"真实缓存horn采样率不是48kHz")
+        V.Check(horn:GetLength()>.2 and horn:GetLength()<12 and horn:GetDataSize()>1000,"真实horn资源没有有效长度/解码数据")
+        V.Near(horn:GetFrequency(),22050,22050,"真实缓存horn采样率不是项目合成采样率")
         V.Check(not horn:IsLooped() and Audio.PlayHorn(),"horn未以真实单次资源播放")
         V.Check(not Audio.GetDiagnostics().hornUsingFallback,"存在六horn却偷偷回退程序horn")
         print(string.format("[架空铁路自检] HORN_RESOURCE %s path=%s seconds=%.3f frequency=%.0f",train.name,train.horn,horn:GetLength(),horn:GetFrequency()))
         local initial=loopMap()
         local owned=Audio.GetDiagnostics().ownedSoundCount
         audioAdvance(0,8,50)
-        local loaded=V.CheckAudioLoops();local traction=false
-        for _,e in ipairs(loaded.loops) do if e.layer=="traction" then traction=e.gain>.01 end end
-        V.Check(traction,"0kmh加牵引没有实际非零traction混音")
+        local loaded=V.CheckAudioLoops();local running=false
+        for _,e in ipairs(loaded.loops) do if e.layer=="running" then running=e.gain>.01 end end
+        V.Check(running,"0kmh加牵引没有实际非零running混音")
         audioAdvance(90,0,50)
-        local rolling,wind,changed=false,false,false
+        local fast,changed=false,false
         for _,e in ipairs(V.CheckAudioLoops().loops) do
-            if e.layer=="rolling" then rolling=e.gain>.01 end
-            if e.layer=="wind" then wind=e.gain>.001 end
+            if e.layer=="running" then fast=e.gain>.01 end
             if initial[e.id] and math.abs(initial[e.id].frequency-e.frequency)>10 then changed=true end
         end
-        V.Check(rolling and wind and changed,"惰行速度没有实际rolling/wind增益与frequency连续调制")
+        V.Check(fast and changed,"惰行速度没有实际running增益与frequency连续调制")
         V.Check(Audio.GetDiagnostics().ownedSoundCount==owned,"普通Update不断生成新Sound资源")
         local before=loopMap();local elapsed=Audio.GetDiagnostics().elapsed
         Audio.SetSuspended(true)

@@ -4,17 +4,22 @@
 --                     拱冠Y=12.6
 --              /-------------------\
 -- Y=8.8最小顶 /                     \ Y=8.8
--- 墙x=-12.0 | lane1=-5  lane0/2=0   | 墙x=+7.0
+-- 墙x=-7.0  | lane0/2=0  lane1=+5  | 墙x=+12.0
 --            |                       |
 --            +---原道床/轨面Y不变----+
 -- 隧道仅选站外直线：距站点>=1000且避开s-760..s+460站场，站外lane2与lane0重合。
 -- 桥：道床底Y=.002 > 桥面Y=-.18 > 下梁/桥墩；全幅谷地切掉平地保底和Terrain地表。
 -- 相机仅射线mask4；障碍表面用viewMask6（同时正常相机3可见），非障碍河床用2。
--- 已查实际站外接触网杆顶Y=7.90、基础外缘X=-10.325/+5.325，均在内壁/8.79门户以下。
+-- 洞内接触网采用顶挂；桥柱置于桥面外沿内侧，不在谷底生成普通基础。
 local Route = require "world.Route"
 local World = require "world.WorldMaterials"
+local ReliefConfig = require "config.ReliefConfig"
+local Relief = require "world.ReliefGeometry"
+local GameConfig = require "config.GameConfig"
 local Landmarks = {}
-Landmarks.TunnelCenter = -2.5
+Landmarks.TunnelCenter = 2.5
+Landmarks.BridgeCenter = 2.5
+Landmarks.BridgeDeckWidth = 18.4
 Landmarks.TunnelHalfWidth = 9.5
 Landmarks.TunnelWallHeight = 8.8
 Landmarks.TunnelCrownHeight = 12.6
@@ -40,6 +45,11 @@ Landmarks.BridgeDeckTop = -.18
 ---@field portalCrownHeight? number
 ---@field stationClearance? number
 ---@field deckTop? number
+---@field portalTransition? number
+---@field side? number
+---@field toe? number
+---@field crest? number
+---@field outer? number
 ---@type RailwayLandmark[]
 local definitions_ = {}
 ---@type RailwayLandmark[]
@@ -48,6 +58,8 @@ local bridges_ = {}
 local tunnels_ = {}
 ---@type RailwayLandmark[]
 local mountains_ = {}
+---@type RailwayLandmark[]
+local slopes_ = {}
 ---@type table<string, table>
 local chunks_ = {}
 ---@type table<string, table>
@@ -76,16 +88,24 @@ local function textured(key,path,color,roughness)
     return materials_[key]
 end
 local function rockMaterial()
-    return textured("weatheredRock","Textures/Railway/ballast.png",Color(.64,.65,.60))
+    -- 岩面用偏暗的冷灰褐：旧 ballast 浅灰在日光下会变成刺眼白板。
+    return textured("weatheredRock","Textures/Railway/ballast.png",Color(.44,.44,.40))
 end
 local function grassMaterial()
-    return textured("slopeGrass","Textures/Railway/grass.png",Color(.82,.87,.76),.98)
+    -- 桥隧谷坡改用带法线的高清草地纹理，与地形地表一致，避免坡面发灰。
+    return World.Terrain("SlopeGrass","Textures/Railway/grass_detail.tga",
+        "Textures/Railway/grass_detail_normal.tga",Color(.72,.80,.62),.97,6.0)
 end
+---@param s number
+---@param x number
+---@param y number
+---@return Vector3
 local function point(s,x,y) return Route.SampleOffset(s,x,y) end
 local function add(def)
     definitions_[#definitions_+1]=def
     if def.kind=="bridge" then bridges_[#bridges_+1]=def
     elseif def.kind=="tunnel" then tunnels_[#tunnels_+1]=def
+    elseif def.kind=="slope" then slopes_[#slopes_+1]=def
     else mountains_[#mountains_+1]=def end
 end
 local function stationGap(a,b)
@@ -103,7 +123,7 @@ local function bounds(poly)
     return x0,x1,z0,z1
 end
 function Landmarks.Init()
-    definitions_,bridges_,tunnels_,mountains_,cuts_,chunks_,buildings_,owners_={},{},{},{},{},{},{},{}
+    definitions_,bridges_,tunnels_,mountains_,slopes_,cuts_,chunks_,buildings_,owners_={},{},{},{},{},{},{},{},{}
     routeLength_=Route.GetLength()
     local straight=0
     for _,seg in ipairs(Route.GetSegments()) do
@@ -113,9 +133,13 @@ function Landmarks.Init()
                 local first=seg.s+(seg.length-640)*.5
                 local last=first+640
                 if last-first>=400 and stationGap(first,last) then
-                    local def={id="rail_bridge_"..straight,kind="bridge",name=seg.landmark=="bridge_a" and "星汐青川铁路桥" or "镜澜深谷铁路桥",
-                        first=first,last=last,s=(first+last)*.5,lateral=-2.5,halfWidth=520,height=0,
-                        depth=seg.landmark=="bridge_a" and 38 or 46,waterY=seg.landmark=="bridge_a" and -27 or -34}
+                    local def={id="rail_bridge_"..straight,kind="bridge",name=GameConfig.MountainTerrain and not GameConfig.MountainTerrain.First and
+                            (seg.landmark=="bridge_a" and "赤壁峡谷铁路桥" or "云脊高原铁路桥") or
+                            (seg.landmark=="bridge_a" and "星汐青川铁路桥" or "镜澜深谷铁路桥"),
+                        first=first,last=last,s=(first+last)*.5,lateral=Landmarks.BridgeCenter,halfWidth=520,height=0,
+                        depth=seg.landmark=="bridge_a" and 38 or 46,
+                        -- 水位抬到接近轨面：参考图湖面在视线高度可见，不是深谷暗河。
+                        waterY=seg.landmark=="bridge_a" and -14 or -16}
                     add(def)
                     local poly={point(first,def.lateral-def.halfWidth,0),point(last,def.lateral-def.halfWidth,0),
                         point(last,def.lateral+def.halfWidth,0),point(first,def.lateral+def.halfWidth,0)}
@@ -126,30 +150,49 @@ function Landmarks.Init()
                 local first=seg.s+600
                 local last=seg.s+seg.length-600
                 if last-first>=600 and stationGap(first,last) then
-                    add({id="rail_tunnel_"..straight,kind="tunnel",name=seg.landmark=="tunnel_a" and "岚港翠岭隧道" or "榆岑云脊隧道",
-                        first=first,last=last,s=(first+last)*.5,lateral=-2.5,halfWidth=360,
+                    add({id="rail_tunnel_"..straight,kind="tunnel",name=GameConfig.MountainTerrain and not GameConfig.MountainTerrain.First and
+                            (seg.landmark=="tunnel_a" and "赤壁石门隧道" or "云脊雪岭隧道") or
+                            (seg.landmark=="tunnel_a" and "岚港翠岭隧道" or "榆岑云脊隧道"),
+                        first=first,last=last,s=(first+last)*.5,lateral=Landmarks.TunnelCenter,halfWidth=360,
                         height=seg.landmark=="tunnel_a" and 215 or 265,depth=0,waterY=0})
                 end
             end
         end
     end
-    -- 单独可见山峰按固定弧长布置，仅规划数十项；不是全线生成顶点。
-    -- 椭圆基底半宽230m/半长310m；最内缘距铁路>=190m，两侧无遮挡大山而非几棵树。
-    local index=0
-    for s=6900,routeLength_-2200,1150 do
-        local inTunnel=false
-        for _,t in ipairs(tunnels_) do if s>t.first-550 and s<t.last+550 then inTunnel=true end end
-        for _,b in ipairs(bridges_) do if s>b.first-500 and s<b.last+500 then inTunnel=true end end
-        local nearCity=false
-        for _,st in ipairs(Route.GetStations()) do if math.abs(s-st.s)<1600 then nearCity=true end end
-        if not inTunnel and not nearCity then
-            index=index+1
-            local side=index%2==0 and 1 or -1
-            add({id="ridge_"..index,kind="mountain",name="翠岭山峰"..index,first=s-310,last=s+310,s=s,
-                lateral=side*(440+(index%3)*120),halfWidth=230,height=170+(index*43)%111,depth=0,waterY=0})
+    -- 保留旧桥隧精确里程；地貌配置只增加工程，不修改Route或站点。
+    for _,source in ipairs(ReliefConfig.Structures) do
+        assert(stationGap(source.first,source.last),"[Landmarks] 新工程侵入车站保留区 "..source.id)
+        local straightOwner=false
+        for _,seg in ipairs(Route.GetSegments()) do
+            if seg.type=="straight" and source.first>=seg.s and source.last<=seg.s+seg.length then straightOwner=true end
         end
+        assert(straightOwner,"[Landmarks] 新桥隧必须完整处于既有直线 "..source.id)
+        for _,old in ipairs(definitions_) do
+            assert(source.last<=old.first or source.first>=old.last,"[Landmarks] 桥隧重叠 "..source.id)
+        end
+        add({id=source.id,kind=source.kind,name=source.name,first=source.first,last=source.last,
+            s=(source.first+source.last)*.5,lateral=source.kind=="bridge" and Landmarks.BridgeCenter or Landmarks.TunnelCenter,
+            halfWidth=source.halfWidth,height=source.height or 0,depth=source.depth or 0,waterY=source.waterY or 0})
     end
-    print(string.format("[Landmarks] 已规划%d座铁路桥/%d条双线真隧道/%d座170..280m山峰；轨面保持Y=.34",#bridges_,#tunnels_,#mountains_))
+    -- 所有河谷登记真实地面差集。新增桥也切掉保底/地表，不以平地桥替代河谷。
+    cuts_={}
+    for _,def in ipairs(bridges_) do
+        local poly={point(def.first,def.lateral-def.halfWidth,0),point(def.last,def.lateral-def.halfWidth,0),
+            point(def.last,def.lateral+def.halfWidth,0),point(def.first,def.lateral+def.halfWidth,0)}
+        local x0,x1,z0,z1=bounds(poly)
+        cuts_[#cuts_+1]={points=poly,x0=x0,x1=x1,z0=z0,z1=z1}
+    end
+    for _,source in ipairs(ReliefConfig.Peaks) do
+        add({id=source.id,kind="mountain",name=source.id,first=source.s-310,last=source.s+310,s=source.s,
+            lateral=source.lateral,halfWidth=source.halfWidth,height=source.height,depth=0,waterY=0})
+    end
+    for _,source in ipairs(ReliefConfig.Slopes) do
+        assert(stationGap(source.first,source.last),"[Landmarks] 近线山坡侵入车站保留区 "..source.id)
+        add({id=source.id,kind="slope",name=source.name,first=source.first,last=source.last,s=(source.first+source.last)*.5,
+            lateral=source.side*(source.toe+source.outer)*.5,halfWidth=(source.outer-source.toe)*.5,
+            height=source.height,depth=0,waterY=0,side=source.side,toe=source.toe,crest=source.crest,outer=source.outer})
+    end
+    print(string.format("[Landmarks] %s 合成地貌：%d桥/%d真隧道/%d近线切坡/%d分区山脊；轨面/里程/站点不变",ReliefConfig.Version,#bridges_,#tunnels_,#slopes_,#mountains_))
     for _,def in ipairs(definitions_) do
         if def.kind~="mountain" then
             local _,gap=stationGap(def.first,def.last)
@@ -157,7 +200,8 @@ function Landmarks.Init()
             if def.kind=="tunnel" then
                 def.innerHalfWidth=9.5; def.wallHeight=8.8; def.crownHeight=12.6
                 def.portalHalfWidth=9.48; def.portalWallHeight=8.79; def.portalCrownHeight=12.58
-            else def.deckTop=-.18 end
+                def.portalTransition=ReliefConfig.PortalTransition
+            elseif def.kind=="bridge" then def.deckTop=-.18 end
             print(string.format("[Landmarks] %s %.2f..%.2fkm，最近站点净距%.0fm",def.name,def.first/1000,def.last/1000,gap))
         end
     end
@@ -214,7 +258,11 @@ function Landmarks.Reserves(pos,radius)
     local _,s=Route.DistanceTo(pos)
     local lateral=(pos-Route.Sample(s)):DotProduct(Route.RightAt(s))
     for _,def in ipairs(definitions_) do
-        if s+r>=def.first and s-r<=def.last and math.abs(lateral-def.lateral)<def.halfWidth+r then return true end
+        local transition=def.kind=="tunnel" and (def.portalTransition or 0) or (def.kind=="mountain" and 90 or 0)
+        local halfWidth=def.kind=="tunnel" and math.max(def.halfWidth*1.14,94)
+            or (def.kind=="mountain" and def.halfWidth*1.28 or def.halfWidth)
+        if s+r>=def.first-transition and s-r<=def.last+transition
+            and math.abs(lateral-def.lateral)<halfWidth+r then return true end
     end
     return false
 end
@@ -319,7 +367,7 @@ local function tunnel(owner,def,a,b,data,pause)
         local aa,bb=worldSection(s,outerSection(def,s)),worldSection(finish,outerSection(def,finish))
         for i=1,#aa-1 do shellQuad(rock,grass,i,aa[i],bb[i],bb[i+1],aa[i+1]) end
         for side=-1,1,2 do
-            local lat=-2.5+side*9.47
+            local lat=Landmarks.TunnelCenter+side*9.47
             doubleQuad(stripe,point(s,lat,1.15),point(finish,lat,1.15),point(finish,lat,1.38),point(s,lat,1.38))
         end
         data.tunnelLength=data.tunnelLength+finish-s
@@ -344,10 +392,13 @@ local function tunnel(owner,def,a,b,data,pause)
     data.minTunnelHeight=math.min(data.minTunnelHeight,8.8)
 end
 local function valleyY(def,s,lateral)
-    local along=math.sin(math.pi*math.max(0,math.min(1,(s-def.first)/(def.last-def.first))))^.45
+    local t=math.max(0,math.min(1,(s-def.first)/(def.last-def.first)))
+    -- 连续缓降至真实谷底，桥台处高度和一阶变化都归零，不造竖直截断地墙。
+    local along=smooth(math.min(t,1-t)/.30)
     local across=1-smooth((math.abs(lateral-def.lateral)-330)/190)
     return -.25-def.depth*along*across
 end
+function Landmarks.GetValleyY(def,s,lateral) return valleyY(def,s,lateral) end
 -- 河岸是静态连续条带，不是方形水面上摆一圈独立石头节点。
 -- local Vector3 为(lateral,Y,s)，先按块first/last裁切，再转真实Route坐标；UV跨块连续。
 local function riverPatch(target,polygon,first,last,def)
@@ -376,21 +427,28 @@ local function riverPatch(target,polygon,first,last,def)
     end
 end
 local function river(owner,def,first,last,earth,water,data,pause)
-    -- 河心摆动<=17m、半宽<=59m；两级岸带最大44m，所有新增面低于轨面。
-    -- 横向端部收窄并进入原谷坡(x=±400)，没有裸露矩形封边；不动谷cut和桥墩底。
-    if last<=def.s-122 or first>=def.s+122 then return end
+    -- 宽阔湖面：参考图的水面是一大片不规则湖/海湾，不是窄河。
+    -- 河心大幅摆动、宽度沿程变化、三级缓坡岸带，形成自然不规则岸线。
+    -- 横向端部收窄并进入原谷坡，没有裸露矩形封边；不动谷cut和桥墩底。
+    if last<=def.s-260 or first>=def.s+260 then return end
     local gravel=batch(owner,def.id.."_自然沙砾河岸",textured("riverGravel","Textures/Railway/ballast.png",Color(.83,.79,.66)),false,5)
+    -- 岸边散落石块：参考图湖岸有成片大小不一的石头。
+    local boulders=batch(owner,def.id.."_湖岸石块",rockMaterial(),false,6)
     local function bank(x,side,level)
         local phase=def.s/700
         local taper=1-smooth((math.abs(x)-300)/100)
-        local center=def.s+12*math.sin(x/140+phase)+5*math.sin(x/58-phase)
-        local width=(51+8*math.sin(x/115+phase))*taper
-        local extra=level==0 and 0 or (level==1 and 18 or 44)*taper
+        -- 河心双频摆动，避免笔直水道。
+        local center=def.s+26*math.sin(x/180+phase)+11*math.sin(x/64-phase)
+        -- 基础半宽 128m，沿程起伏 ±26m，端部收窄。
+        local width=(128+26*math.sin(x/130+phase)+13*math.sin(x/47+phase*1.7))*taper
+        -- 三级岸带：水缘 → 砾石滩 → 草坡，逐级抬高。
+        local extra=level==0 and 0 or (level==1 and 26 or (level==2 and 62 or 118))*taper
         local s=center+side*(width+extra)
         local lateral=def.lateral+x
         local bed=valleyY(def,s,lateral)
         local height=level==0 and math.max(def.waterY+.06,bed+.025)
-            or (level==1 and math.max(def.waterY+.85*taper,bed+.025) or bed+.025)
+            or (level==1 and math.max(def.waterY+.85*taper,bed+.025)
+                or (level==2 and math.max(def.waterY+2.4*taper,bed+.025) or bed+.025))
         return Vector3(lateral,height,s)
     end
     for x=-400,360,40 do
@@ -399,36 +457,69 @@ local function river(owner,def,first,last,earth,water,data,pause)
         riverPatch(water,{Vector3(lo.x,def.waterY,lo.z),Vector3(hi.x,def.waterY,hi.z),
             Vector3(nextHi.x,def.waterY,nextHi.z),Vector3(nextLo.x,def.waterY,nextLo.z)},first,last,def)
         for _,side in ipairs({-1,1}) do
-            for level=0,1 do
+            for level=0,2 do
                 local a,b=bank(x,side,level),bank(x,side,level+1)
                 local c,d=bank(x+40,side,level+1),bank(x+40,side,level)
                 local polygon=side==1 and {a,b,c,d} or {d,c,b,a}
-                riverPatch(level==0 and gravel or earth,polygon,first,last,def)
+                riverPatch(level<=1 and gravel or earth,polygon,first,last,def)
+            end
+            -- 岸边石块：沿砾石滩散布大小不一的低矮石头。
+            local seed = def.s + x * 3.1 + side * 17
+            local r1 = math.abs(math.sin(seed * 0.017))
+            if r1 > 0.42 then
+                local r2 = math.abs(math.sin(seed * 0.041 + 1.3))
+                local size = 0.5 + r2 * 2.2
+                local at = bank(x + (r2 - 0.5) * 24, side, 1)
+                if at.z >= first and at.z < last then
+                    -- bank返回(lateral,Y,s)；石块与岸面使用同一线路坐标变换及半开块所有权。
+                    local center = point(at.z, at.x, at.y + size * 0.32)
+                    boulders:AddBox(center, Vector3(size, size * 0.72, size * 0.86), seed * 0.7)
+                end
             end
         end
         if x%120==0 then pauseOnce(pause) end
     end
     data.vertices=data.vertices+gravel:Finish(); data.meshes=data.meshes+1; data.water=data.water+1
+    data.vertices=data.vertices+boulders:Finish(); data.meshes=data.meshes+1
     pauseOnce(pause)
 end
 local function bridge(owner,def,a,b,data,pause)
     local deck=batch(owner,def.id.."_轨下桥面梁墩",World.Concrete(),true,4)
     local steel=batch(owner,def.id.."_轨外护栏",solid("bridgeSteel",Color(.25,.37,.40),.35,.60),true,5)
     local earth=batch(owner,def.id.."_实际深谷坡面",grassMaterial(),false,16)
-    local water=batch(owner,def.id.."_横穿铁路河流",solid("river",Color(.10,.32,.36),.16,.25),false,36)
+    local water=batch(owner,def.id.."_横穿铁路河流",World.Water(),false,36)
     local first,last=math.max(a,def.first),math.min(b,def.last)
     local offsets={-520,-400,-330,-180,0,180,330,400,520}
-    for s=first,last-.001,32 do
-        local finish=math.min(last,s+32)
-        local _,_,yaw=Route.Sample((s+finish)*.5)
-        local angle=math.rad(yaw)
-        local mid=(s+finish)*.5
-        deck:AddBox(point(mid,-2.5,-.68),Vector3(18.4,1.0,finish-s+.02),angle)
-        -- 既有线路外侧围栏位于±14m；轨下窄维护踏道承托它，不改Infrastructure。
-        for _,lat in ipairs({-14.0,14.0}) do deck:AddBox(point(mid,lat,-.68),Vector3(1.2,1.0,finish-s+.02),angle) end
-        for _,lat in ipairs({-7.1,2.1}) do deck:AddBox(point(mid,lat,-2.05),Vector3(1.1,1.75,finish-s+.02),angle) end
-        for _,lat in ipairs({-11.2,6.2}) do
-            steel:AddBox(point(mid,lat,.82),Vector3(.14,1.35,finish-s+.02),angle)
+    -- 桥面截面（m）：双线道床保持原高程；两侧0.62m检修道、低挡砟墙与透空栏杆。
+    -- 承重构造全部位于轨下：箱梁顶=-.18，圆端墩帽顶=-1.20，墩底穿入实际谷床0.6m。
+    -- 两端四角分别取Route高程，不用水平长盒横跨纵坡造成悬空接缝。
+    local function prism(target,s0,s1,lateral,width,y,height)
+        local r0,r1=Route.RightAt(s0)*(width*.5),Route.RightAt(s1)*(width*.5)
+        local c0,c1=point(s0,lateral,y),point(s1,lateral,y)
+        local up=Vector3(0,height*.5,0)
+        local aa,bb,cc,dd=c0-r0-up,c0+r0-up,c0+r0+up,c0-r0+up
+        local ee,ff,gg,hh=c1-r1-up,c1+r1-up,c1+r1+up,c1-r1+up
+        target:AddQuad(dd,hh,gg,cc);target:AddQuad(aa,bb,ff,ee)
+        target:AddQuad(aa,dd,cc,bb);target:AddQuad(ee,ff,gg,hh)
+        target:AddQuad(aa,ee,hh,dd);target:AddQuad(bb,cc,gg,ff)
+    end
+    for s=first,last-.001,16 do
+        local finish=math.min(last,s+16)
+        prism(deck,s,finish,def.lateral,Landmarks.BridgeDeckWidth,-.68,1.0)
+        -- 双箱梁下腹板与低挡砟墙，替换旧粗大竖直实心栏板。
+        for _,offset in ipairs({-4.6,4.6}) do
+            prism(deck,s,finish,def.lateral+offset,2.10,-1.72,1.08)
+        end
+        for _,side in ipairs({-1,1}) do
+            prism(deck,s,finish,def.lateral+side*8.65,.28,.04,.44)
+            prism(deck,s,finish,def.lateral+side*8.04,.62,-.07,.22)
+            for _,height in ipairs({.48,1.14}) do
+                steel:AddTube(point(s,def.lateral+side*8.67,height),point(finish,def.lateral+side*8.67,height),.032,6)
+            end
+            -- 金属竖杆全线固定1.5m格点；每块半开归属，无跨块重叠节点。
+            for at=math.ceil(s/1.5)*1.5,finish-.00001,1.5 do
+                steel:AddTube(point(at,def.lateral+side*8.67,.26),point(at,def.lateral+side*8.67,1.17),.027,6)
+            end
         end
         for i=1,#offsets-1 do
             local lo,hi=def.lateral+assert(offsets[i]),def.lateral+assert(offsets[i+1])
@@ -438,16 +529,23 @@ local function bridge(owner,def,a,b,data,pause)
         data.bridgeLength=data.bridgeLength+finish-s
         pauseOnce(pause)
     end
-    -- 墩位全线固定，块半开所有权唯一；底部抵达实际河床，而不是平地边公路桥。
-    for s=def.first+40,def.last-20,80 do
+    -- 参考图长高架的32m有节奏桥跨；圆端双墩不是80m一根巨大方柱。
+    -- 定位弧长和半开所有权稳定，墩帽/支座/基础都在真实桥面下面。
+    for s=def.first+24,def.last-12,32 do
         if s>=a and s<b then
-            local bottom=valleyY(def,s,-2.5)-.6
-            local top=-1.20
-            local pierHeight=math.max(.2,top-bottom)
+            local bottom=valleyY(def,s,def.lateral)-.6
+            local top=-1.65
             local _,_,yaw=Route.Sample(s)
-            deck:AddBox(point(s,-2.5,(top+bottom)*.5),Vector3(4.6,pierHeight,3.2),math.rad(yaw))
-            deck:AddBox(point(s,-2.5,bottom+.45),Vector3(8.8,.9,6.8),math.rad(yaw))
-            deck:AddBox(point(s,-2.5,-1.20),Vector3(14.2,.8,4.2),math.rad(yaw))
+            for _,offset in ipairs({-2.1,2.1}) do
+                deck:AddTube(point(s,def.lateral+offset,bottom+.6),point(s,def.lateral+offset,top),.88,12)
+                deck:AddBox(point(s,def.lateral+offset,-1.54),Vector3(1.85,.30,2.7),math.rad(yaw))
+            end
+            deck:AddBox(point(s,def.lateral,bottom+.45),Vector3(8.8,.9,6.8),math.rad(yaw))
+            deck:AddBox(point(s,def.lateral,-1.20),Vector3(12.4,.65,3.0),math.rad(yaw))
+            -- 跨缝设于检修道、梁侧，不穿过钢轨顶或接触网。
+            for side=-1,1,2 do
+                steel:AddBox(point(s,def.lateral+side*8.02,.05),Vector3(.68,.025,.10),math.rad(yaw))
+            end
             data.piers=data.piers+1
             pauseOnce(pause)
         end
@@ -466,12 +564,16 @@ local peakRadii_={1,.78,.52,.27,.09}
 local peakLevels_={0,.22,.49,.74,.93}
 local peakShiftX_={0,.025,-.035,.075,.12}
 local peakShiftZ_={0,-.045,.055,.11,.08}
+---@type number[]
 local peakCrest_={.89,.94,.98,1,.93,.90,.92,.96,.94,.90,.86,.87}
 local function mountain(owner,def,data,pause)
     local rock=batch(owner,def.id.."_大山",rockMaterial(),false,12)
     local grass=batch(owner,def.id.."_岩脊草坡",grassMaterial(),false,16)
     local origin=point(def.s,def.lateral,0)
     local right,tangent=Route.RightAt(def.s),Route.TangentAt(def.s)
+    ---@param ring integer
+    ---@param i integer
+    ---@return Vector3
     local function p(ring,i)
         local angle=(i%12)*math.pi/6
         local radius=assert(peakRadii_[ring+1])
@@ -492,7 +594,9 @@ local function mountain(owner,def,data,pause)
         end
     end
     -- 盖住最后一个有限面积环，不把所有上坡面收敛到同一个顶点。
+    ---@param v Vector3
     local function uv(v)
+        ---@type Vector3
         local delta=v-origin
         return Vector2(delta:DotProduct(right)/12,delta:DotProduct(tangent)/12)
     end
@@ -506,25 +610,49 @@ local function mountain(owner,def,data,pause)
     data.meshes=data.meshes+2; data.mountains[def.id]=true
     data.maxMountainHeight=math.max(data.maxMountainHeight,def.height)
 end
----@param owner Node
----@param first number
----@param last number
----@param pause? fun()
+
+-- 判断某世界坐标是否落在桥下水面范围内（含一定余量）。
+-- 水面是宽水域，植被/电杆/农田都不能落在里面。
+---@param pos Vector3
+---@param margin number|nil
+---@return boolean
+function Landmarks.InWater(pos, margin)
+    local m = margin or 0
+    for _, def in ipairs(bridges_) do
+        if def.waterY and def.waterY > -25 then
+            local _, s = Route.DistanceTo(pos)
+            if s >= def.first - 60 and s <= def.last + 60 then
+                local origin = point(def.s, def.lateral, 0)
+                local dx, dz = pos.x - origin.x, pos.z - origin.z
+                if math.sqrt(dx * dx + dz * dz) < 520 + m then return true end
+            end
+        end
+    end
+    return false
+end
+
 function Landmarks.BuildChunk(owner,first,last,pause)
     ensure()
     local key=string.format("%.3f_%.3f",first,last)
-    local data={first=first,last=last,bridges={},tunnels={},mountains={},vertices=0,meshes=0,portals=0,piers=0,water=0,
-        bridgeLength=0,tunnelLength=0,minTunnelHalfWidth=math.huge,minTunnelHeight=math.huge,maxValleyDepth=0,maxMountainHeight=0}
+    local data={first=first,last=last,bridges={},tunnels={},mountains={},slopes={},vertices=0,meshes=0,portals=0,piers=0,water=0,
+        bridgeLength=0,tunnelLength=0,slopeLength=0,portalApproachLength=0,minTunnelHalfWidth=math.huge,minTunnelHeight=math.huge,maxValleyDepth=0,maxMountainHeight=0}
     chunks_[key]=data
     local root=owner:CreateChild("铁路桥隧与山体")
     owners_[key]=root
     for _,def in ipairs(definitions_) do
         if def.kind=="mountain" then
             if def.s>=first and def.s<last then mountain(root,def,data,pause) end
-        elseif def.last>first and def.first<last then
-            if def.kind=="tunnel" then tunnel(root,def,first,last,data,pause)
-            else bridge(root,def,first,last,data,pause) end
-        end
+        elseif def.kind=="slope" then
+            -- 山地图连续山坡由Terrain的同源空间网格承担，禁止再叠一层独立条带。
+            if (not GameConfig.MountainTerrain or (GameConfig.MountainTerrain.First and def.last<=GameConfig.MountainTerrain.First))
+                and def.last>first and def.first<last then Relief.BuildSlope(root,def,first,last,data,pause) end
+        elseif def.kind=="tunnel" then
+            if def.last>first and def.first<last then tunnel(root,def,first,last,data,pause) end
+            local transition=def.portalTransition or 80
+            if (first<def.first and last>def.first-transition) or (first<def.last+transition and last>def.last) then
+                Relief.BuildPortalApproach(root,def,first,last,data,pause)
+            end
+        elseif def.last>first and def.first<last then bridge(root,def,first,last,data,pause) end
     end
     return data.vertices
 end
@@ -545,20 +673,24 @@ function Landmarks.GetChunkData() return chunks_ end
 function Landmarks.NoteBuildings(key,data) buildings_[key]=data end
 function Landmarks.ForgetBuildings(key) buildings_[key]=nil end
 function Landmarks.Shutdown()
-    definitions_,bridges_,tunnels_,mountains_,cuts_,chunks_,buildings_,owners_={},{},{},{},{},{},{},{}
+    definitions_,bridges_,tunnels_,mountains_,slopes_,cuts_,chunks_,buildings_,owners_={},{},{},{},{},{},{},{},{}
     routeLength_=-1
 end
 function Landmarks.GetStats()
     ensure()
-    local stats={plannedBridges=#bridges_,plannedTunnels=#tunnels_,plannedMountains=#mountains_+#tunnels_,bridges=0,tunnels=0,
-        mountains=0,highRises=0,portals=0,piers=0,bridgeLength=0,tunnelLength=0,vertices=0,meshes=0,loadedChunks=0,
-        minTunnelHalfWidth=math.huge,minTunnelHeight=math.huge,tunnelCenter=-2.5,tunnelCrownHeight=12.6,
+    local stats={plannedBridges=#bridges_,plannedTunnels=#tunnels_,plannedMountains=#mountains_+#tunnels_,plannedSlopes=#slopes_,bridges=0,tunnels=0,
+        mountains=0,slopes=0,slopeLength=0,portalApproachLength=0,reliefVersion=ReliefConfig.Version,highRises=0,portals=0,piers=0,bridgeLength=0,tunnelLength=0,vertices=0,meshes=0,loadedChunks=0,
+        minTunnelHalfWidth=math.huge,minTunnelHeight=math.huge,tunnelCenter=Landmarks.TunnelCenter,tunnelCrownHeight=12.6,
+        bridgeCenter=Landmarks.BridgeCenter,bridgeDeckWidth=Landmarks.BridgeDeckWidth,
         bridgeDeckTop=-.18,railHeadY=Route.RailHeadHeight,maxValleyDepth=0,maxMountainHeight=0,definitions=definitions_}
-    local bridges,tunnels,mountains={},{},{}
+    local bridges,tunnels,mountains,slopes={},{},{},{}
     for _,data in pairs(chunks_) do
         for id in pairs(data.bridges) do bridges[id]=true end
         for id in pairs(data.tunnels) do tunnels[id]=true end
         for id in pairs(data.mountains) do mountains[id]=true end
+        for id in pairs(data.slopes) do slopes[id]=true end
+        stats.slopeLength=stats.slopeLength+data.slopeLength
+        stats.portalApproachLength=stats.portalApproachLength+data.portalApproachLength
         stats.portals=stats.portals+data.portals; stats.piers=stats.piers+data.piers
         stats.bridgeLength=stats.bridgeLength+data.bridgeLength; stats.tunnelLength=stats.tunnelLength+data.tunnelLength
         stats.vertices=stats.vertices+data.vertices; stats.meshes=stats.meshes+data.meshes; stats.loadedChunks=stats.loadedChunks+1
@@ -570,6 +702,7 @@ function Landmarks.GetStats()
     for _ in pairs(bridges) do stats.bridges=stats.bridges+1 end
     for _ in pairs(tunnels) do stats.tunnels=stats.tunnels+1 end
     for _ in pairs(mountains) do stats.mountains=stats.mountains+1 end
+    for _ in pairs(slopes) do stats.slopes=stats.slopes+1 end
     for _,data in pairs(buildings_) do stats.highRises=stats.highRises+(data.highRises or 0) end
     local vertices=0
     local meshes=Landmarks.GetMeshes()

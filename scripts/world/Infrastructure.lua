@@ -215,6 +215,26 @@ local function buildCatenary(root,rangeStart,rangeEnd,pause)
     bases:Finish(); if pause then pause() end
 end
 
+-- 纵坡电缆槽沿两端标高连成矩形槽，不以水平长盒切入上坡/悬在下坡。
+-- 截面仍是原0.38×0.17m、端缝0.05m；竖向偏移保持世界Y，与SampleOffset契约一致。
+---@param batch RailwayBatch
+---@param a Vector3
+---@param b Vector3
+---@param right Vector3
+local function gradedTrough(batch, a, b, right)
+    local halfWidth, halfHeight = right * .19, Vector3(0, .085, 0)
+    local a1, a2 = a - halfWidth - halfHeight, a + halfWidth - halfHeight
+    local a3, a4 = a + halfWidth + halfHeight, a - halfWidth + halfHeight
+    local b1, b2 = b - halfWidth - halfHeight, b + halfWidth - halfHeight
+    local b3, b4 = b + halfWidth + halfHeight, b - halfWidth + halfHeight
+    batch:AddQuad(a4, b4, b3, a3)
+    batch:AddQuad(a1, a2, b2, b1)
+    batch:AddQuad(a1, a4, a3, a2)
+    batch:AddQuad(b1, b2, b3, b4)
+    batch:AddQuad(a1, b1, b4, a4)
+    batch:AddQuad(a2, a3, b3, b2)
+end
+
 ---@param root Node
 local function buildCorridor(root,rangeStart,rangeEnd,pause)
     local concrete=World.NewBatch(root:CreateChild("CableTroughsAndPosts"),materials_[4],false,1)
@@ -230,8 +250,16 @@ local function buildCorridor(root,rangeStart,rangeEnd,pause)
             for side=-1,1,2 do
                 -- 双正线外侧维护带；负侧先相对lane1=-5偏移，不能沿旧-2.75占两线间。
                 local center=side<0 and -5 or 0
-                concrete:AddBox(Route.SampleOffset(midS,center+side*2.75,.105),
-                    Vector3(.38,.17,math.max(.01,nextS-s-.05)),angle)
+                local lateral = center + side * 2.75
+                local firstS, lastS = s + .025, nextS - .025
+                local firstPoint, lastPoint = Route.SampleOffset(firstS,lateral,.105), Route.SampleOffset(lastS,lateral,.105)
+                if math.abs(firstPoint.y-lastPoint.y) < .000001 then
+                    -- 普通水平线路仍走原合批形状，原有绝对Y和米制尺寸不变。
+                    concrete:AddBox(Route.SampleOffset(midS,lateral,.105),
+                        Vector3(.38,.17,math.max(.01,nextS-s-.05)),angle)
+                else
+                    gradedTrough(concrete,firstPoint,lastPoint,Route.RightAt(midS))
+                end
                 beam(drainage,Route.SampleOffset(s,center+side*3.55,.022),
                     Route.SampleOffset(nextS,center+side*3.55,.022),.42)
                 for _,offset in ipairs({3.29,3.81}) do

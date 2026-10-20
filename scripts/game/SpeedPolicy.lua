@@ -2,6 +2,15 @@
 -- 横向加速度和服务制动留有余量，是驾驶模拟调校，不代表真实线路认证。
 local SpeedPolicy = {}
 
+--- 山区制动提示保守扣除下坡重力；不改变玩家的实际制动指令。
+---@param rated number
+---@param downhillGrade number
+---@return number
+function SpeedPolicy.ServiceDeceleration(rated,downhillGrade)
+    local grade=math.max(0,downhillGrade)
+    return math.max(.1,rated-9.81*grade/math.sqrt(1+grade*grade))
+end
+
 ---@param radius number
 ---@param lineLimit number
 ---@return number

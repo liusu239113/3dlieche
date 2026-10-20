@@ -6,16 +6,18 @@
 local FictionalWorld = require "config.FictionalWorld"
 local GameConfig = {}
 
-GameConfig.Title = FictionalWorld.name .. " · 铁路旅程"
+GameConfig.Title = "TRS实况铁路模拟"
 
 -- 默认先保障移动端负载；细致模式保留近景阴影与镜面，不影响运营逻辑或资源完整性。
 GameConfig.RenderQuality = "performance"
 
 -- ---------------------------------------------------------------------------
 -- 线路：有端点的五站走廊，左右交替曲线，不再首尾闭合。
--- 星澜群域的五座架空城市；名称、线路与运营规则不映射现实铁路。
--- ---------------------------------------------------------------------------
+-- 星澜群域的五座架空城市；采用中国铁路工程与左行运营风格，不冒称实测复刻。
+-- 各弧内加入对称缓和曲线；保留每段里程、总转角和站序，工程性调整世界XZ。
 GameConfig.RouteClosed = false
+GameConfig.RouteTransitions = true
+GameConfig.RouteTransitionLength = 120
 GameConfig.RouteSegments = {
     { type="straight",length=2200 },
     { type="arc",radius=1600,angle=32,dir=1 },
@@ -48,6 +50,14 @@ GameConfig.RouteStep = 10.0       -- 调试/包围盒点；车辆与净空使用
 GameConfig.WorldStream = {
     FrameBudgetMs = 3.0,
     MaxTaskSlices = 32,
+    HighSpeedFrameBudgetMs = 6.0,
+    HighSpeedMaxTaskSlices = 64,
+    -- 狂暴只扩大预取窗口，绝不作为速度上限或制动器。
+    RageViewAhead = 5200,
+    RageDetailAhead = 2400,
+    RageInfrastructureAhead = 3000,
+    RageSceneryAhead = 3200,
+    RageTerrainRadius = 2400,
     RefreshInterval = 0.20,
     TrackChunkLength = 120,
     DetailAhead = 480,
@@ -57,9 +67,9 @@ GameConfig.WorldStream = {
     UnloadMargin = 720,
     InitialDetailAhead = 240,
     InitialDetailBehind = 240,
-    InitialInfrastructureRadius = 96,
-    -- 4个旧32m设施块合为128m空间批；导线/护栏原采样不变，协程仍逐段让出。
-    InfrastructureChunkLength = 128,
+    InitialInfrastructureRadius = 150,
+    -- 中国式接触网按全线50m网格归属；半开块在任意边界不重复柱位。
+    InfrastructureChunkLength = 100,
     InfrastructureAhead = 1500,
     InfrastructureBehind = 1100,
     StationRadius = 2800,
@@ -70,7 +80,7 @@ GameConfig.WorldStream = {
     InitialSceneryRadius = 240,
     TerrainCellSize = 160,
     TerrainRadius = 1120,
-    VegetationRadius = 360,
+    VegetationRadius = 640,
     Seed = 20261006,
 }
 

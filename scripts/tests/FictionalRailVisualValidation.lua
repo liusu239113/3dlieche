@@ -255,7 +255,10 @@ local function checkLiveWorld()
     elseif case.kind=="passengers" or case.kind=="hud" then
         local passenger=Passenger.GetVisualStats()
         V.Check(passenger.visible>8 and passenger.roots==1 and passenger.npcRigidBodies==0,"客运截图无真实站台乘客或NPC物理无界")
-        V.Check(passenger.sharedModels==2 and passenger.geometryBuilds==2,"站台NPC每帧烘焙/不复用真实模型")
+        V.Check(passenger.sharedModels==2 and passenger.sharedPoseFrames==50
+            and passenger.geometryBuilds==0 and passenger.offlinePoseGeometries==100
+            and passenger.cpuBaked and not passenger.skinned and passenger.bonesPerActor==0,
+            "站台NPC未复用离线帧或运行中仍执行蒙皮烘焙")
         V.Check(not Game.CanDepart() and Hud.GetReadings().passenger.doorsOpen,"截图客运状态并非真实未完成登乘")
     end
     V.Check(V.backgroundDraws>30 and V.backgroundAlpha==142,"透明背景只读声明，真实Panel绘制探针从未经过")

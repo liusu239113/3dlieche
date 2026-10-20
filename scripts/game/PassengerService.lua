@@ -5,6 +5,7 @@ local Route = require "world.Route"
 local Station = require "world.Station"
 local RailNetwork = require "world.RailNetwork"
 local Catalog = require "config.TrainCatalog"
+local CoachModels = require "config.CoachModels"
 local Config = require "config.GameConfig"
 local Visuals = require "world.Passengers"
 local PassengerService = {}
@@ -96,36 +97,71 @@ local lastSpeed_ = 0.0
 local comfort_ = 100.0
 local comfortPenalty_ = 0.0
 local DOOR_CLOSE_SECONDS = 1.6
+-- 门边通道是单向连续流：按剩余路径预留0.85米跟随进度，不是候车区实体碰撞。
+-- 车内 -> 门槛 -> 台沿 -> 安全走廊；同站仍严格先下后上，最后一人走完才关门。
+local DOOR_FOLLOW_DISTANCE = .85
+
+---@param actor RailwayPassenger
+---@return number
+local function remainingPath(actor)
+    local distance=0.0
+    local previous=actor.position
+    for i=actor.targetIndex,#actor.targets do
+        local target=actor.targets[i]
+        distance=distance+(target-previous):Length()
+        previous=target
+    end
+    return distance
+end
 
 local function blankPlan()
     return {stationIndex=0,lane=0,platformMin=0,platformMax=0,platformY=0,doors={},valid=false,reason="无停靠站"} --[[@as PassengerDoorPlan]]
 end
 
+local function independentCoachProfile(id)
+    for _, spec in pairs(CoachModels.ByLocomotive) do
+        if spec.source=="generated_asset" and spec.reviewConfirmed and spec.profileId==id then return true end
+    end
+    return false
+end
+
 ---@param station RailwayStation
+---@param candidateCars? TrainCar[] 仅供同步提交前只读验证；不替换当前业务编组。
 ---@return PassengerDoorPlan
-function PassengerService.BuildDoorPlan(station)
+function PassengerService.BuildDoorPlan(station,candidateCars)
     local dimensions = Station.GetDimensions()
     local lane = RailNetwork.GetPlayerLane(Train.GetS())
-    local plan = {stationIndex=station.index,lane=lane,platformMin=dimensions.positivePlatformMin,
-        platformMax=dimensions.positivePlatformMax,platformY=dimensions.platformTopY,
+    local up = lane == RailNetwork.OpposingLane
+    local plan = {stationIndex=station.index,lane=lane,
+        platformMin=up and dimensions.upPlatformMin or dimensions.islandPlatformMin,
+        platformMax=up and dimensions.upPlatformMax or dimensions.islandPlatformMax,platformY=dimensions.platformTopY,
         doors={},valid=false,reason="没有与站台对齐的合法客运车门"} --[[@as PassengerDoorPlan]]
     if Route.Distance(Train.GetS(),station.s) >= Config.Gameplay.StopTolerance then
         plan.reason="列车不在停靠容差内"; return plan
     end
-    if lane ~= RailNetwork.MainLane and lane ~= RailNetwork.SidingLane then
-        plan.reason="当前股道没有相邻客运站台"; return plan
+    if lane ~= RailNetwork.MainLane and lane ~= RailNetwork.SidingLane and not up then
+        plan.reason="渡线咽喉不能进行乘降"; return plan
     end
-    local side = lane == RailNetwork.SidingLane and -1 or 1
+    local side = lane == RailNetwork.MainLane and -1 or 1
     local edgeLateral = side == 1 and plan.platformMin or plan.platformMax
-    -- 正线内缘有 0.05 米压顶（Station.StoneCoping），岛台外缘没有。
-    local edgeY = plan.platformY + (side == 1 and .05 or 0)
+    -- Main岛台近缘及上行外台有石压顶；侧线岛台外缘保持原平面。
+    local edgeY = plan.platformY + (lane ~= RailNetwork.SidingLane and .05 or 0)
     local corridor = side == 1 and plan.platformMin+1.80 or plan.platformMax-1.80
-    for carIndex, car in ipairs(Train.GetCars()) do
+    -- 俯视：车内 <- 门槛 --<=0.9m--> 岛台边缘 --1.8m--> 候车走廊。
+    -- 所有模拟锚也须满足真实站台纵向包络/同股道/门槛高差<=0.35m；
+    -- 擦端越界、换侧线跨轨、机车和驾驶鼻端均不生成门，不放宽安全门限。
+    for carIndex, car in ipairs(candidateCars or Train.GetCars()) do
         local profile = Catalog.Profiles[car.profile]
         local candidates = {} ---@type {z:number,source:string}[]
         if car.profile == "coach" then
             -- 当前 Coach.Openings 精确范围：[-11.1,-10.2]、[10.2,11.1]，门槛 y=1.50。
             candidates={{z=-10.65,source="Coach.Openings"},{z=10.65,source="Coach.Openings"}}
+        elseif profile and independentCoachProfile(car.profile) then
+            -- 独立客车不是旧程序coach，也没有门位实测元数据。用已验收完整
+            -- 车长两端向内2.1m的模拟玄关，明确不声称这是贴图/网格实测门。
+            local z=profile.length*.5-2.1
+            candidates={{z=-z,source="simulated_coach_end_vestibule"},
+                {z=z,source="simulated_coach_end_vestibule"}}
         elseif profile and profile.endSurvey and (car.frontEnd or car.rearEnd) then
             -- 当前动车资产没有实测客运门元数据。此处明确使用模拟玄关锚点：
             -- 在实测平端向内 2.1 米处取候选，排除驾驶鼻端，不声称门位工程实测。
@@ -218,17 +254,22 @@ end
 ---@param actor RailwayPassenger
 ---@param station RailwayStation
 local function leave(actor,station)
-    -- 岛台走道接 StationYard 的真实 +64..83 米梯道，再走 +83 米天桥，
-    -- 最后经横距 -44 米梯道下到站前广场，不在地面横穿运营股道。
-    local y = Station.GetDimensions().platformTopY+.045
+    -- 与StationYard实际桥位一致：长站台的天桥随PlatformEnd后移，不能仍在+83米低空跨轨。
+    -- 站台走廊 -> 桥前22米 -> 19米梯道 -> 10.7米桥面 -> 站外26米梯道。
+    local dimensions=Station.GetDimensions()
+    local y = dimensions.platformTopY+.045
+    local bridgeOffset=math.max(83,dimensions.platformEnd-2)
     local bridgeY = 10.7 -- StationYard DECK_Y 10.4 加桥板半厚 0.30 米。
     local at = Route.ProjectApprox(actor.position)
     local origin = Route.Sample(at)
     local lateral = (actor.position-origin):DotProduct(Route.RightAt(at))
-    path(actor,{Route.SampleOffset(station.s+61,lateral,y),Route.SampleOffset(station.s+61,7.0,y),
-        Route.SampleOffset(station.s+63.6,5.4,y),
-        Route.SampleOffset(station.s+83,5.4,bridgeY),Route.SampleOffset(station.s+83,-44,bridgeY),
-        Route.SampleOffset(station.s+57,-44,.125),Route.SampleOffset(station.s-55,-44,.125)},"leaving")
+    local up=lateral>5
+    local stair=up and 10.4 or -5.4
+    local approach=up and 9.0 or -7.0
+    path(actor,{Route.SampleOffset(station.s+bridgeOffset-22,lateral,y),Route.SampleOffset(station.s+bridgeOffset-22,approach,y),
+        Route.SampleOffset(station.s+bridgeOffset-19.4,stair,y),
+        Route.SampleOffset(station.s+bridgeOffset,stair,bridgeY),Route.SampleOffset(station.s+bridgeOffset,-44,bridgeY),
+        Route.SampleOffset(station.s+bridgeOffset-26,-44,.125),Route.SampleOffset(station.s-55,-44,.125)},"leaving")
 end
 
 ---@param actor RailwayPassenger
@@ -272,13 +313,20 @@ local function bindActors(stop)
     local plan = stop.plan
     if not plan.valid then return end
     local boardingSlot = {} ---@type table<number, integer>
+    local firstSlots={boarding=0,alighting=0}
     local boardingLoads,alightingLoads = {}, {} ---@type table<number,number>,table<number,number>
     local rebound,maxReboundDistance=0,0.0
     for _, actor in ipairs(actors_) do
         if not actor.completed and actor.state~="leaving" and actor.state~="gone" then
             local firstBinding = actor.doorId==0
-            local door = assert(plan.doors[(actor.id-1)%#plan.doors+1])
-            if not firstBinding then
+            local door=assert(plan.doors[1])
+            if firstBinding then
+                -- 按本次乘降序号均匀分门，不能用全局id与目的站数取模共振。
+                -- 已有位置的换车重绑仍走nearestDoor，不把乘客瞬移到远门。
+                local slot=firstSlots[actor.kind] or 0
+                door=assert(plan.doors[slot%#plan.doors+1])
+                firstSlots[actor.kind]=slot+1
+            else
                 local distance
                 door,distance=nearestDoor(actor,plan.doors,actor.kind=="alighting" and alightingLoads or boardingLoads)
                 rebound,maxReboundDistance=rebound+1,math.max(maxReboundDistance,distance)
@@ -305,6 +353,10 @@ local function bindActors(stop)
         stop.station.name,plan.lane,#plan.doors,stop.boarded,stop.totalBoarding,rebound,maxReboundDistance))
 end
 
+function PassengerService.SetVisualQuality(qualityId)
+    Visuals.SetQuality(qualityId)
+end
+
 function PassengerService.GetCapacity(id)
     local entry = Catalog.Find(id or Train.GetSelectedId())
     return entry and entry.kind=="emu" and 608 or 560 -- 8节动车/7节80座客车，不把可视人物数当载客量。
@@ -329,13 +381,32 @@ function PassengerService.Reset()
     Visuals.Update(nil,{},0)
 end
 
+---@param id string
+---@param candidateCars TrainCar[]
+---@return boolean,string
+function PassengerService.ValidateTrainSelection(id,candidateCars)
+    local stop=stop_
+    local waiting=stop and stop.totalBoarding-stop.boarded or 0
+    if #onboard_+waiting>PassengerService.GetCapacity(id) then
+        return false,"新编组容量不足，原乘降清单已保留"
+    end
+    if stop then
+        -- Train暂存组装的同步只读校验：不改stop/actors、无事件/异步/视觉更新。
+        local plan=PassengerService.BuildDoorPlan(stop.station,candidateCars)
+        if not plan.valid then return false,"当前站台不兼容新编组："..plan.reason end
+    end
+    return true,""
+end
+
 ---@param scene Scene
 function PassengerService.Init(scene)
     Visuals.Init(scene)
     initialized_=true
     PassengerService.Reset()
+    Train.SetSelectionValidator(PassengerService.ValidateTrainSelection)
 end
 function PassengerService.Shutdown()
+    Train.SetSelectionValidator(nil)
     Visuals.Shutdown()
     stop_,actors_,onboard_,initialized_=nil,{},{},false
 end
@@ -445,45 +516,26 @@ function PassengerService.Update(dt)
     if math.abs(speed)>.02 or not stop.plan.valid then return end
     if stop.phase=="alighting" or stop.phase=="boarding" then
         local kind=stop.phase=="alighting" and "alighting" or "boarding"
-        local occupied={} ---@type table<number,boolean>
-        local ranks={} ---@type table<number,integer>
-        if kind=="boarding" then
-            for _,actor in ipairs(actors_) do
-                if actor.kind==kind and not actor.completed and actor.doorId>0 then
-                    local door=stop.plan.doors[actor.doorId]
-                    if door then
-                        local rank=ranks[door.id] or 0
-                        ranks[door.id]=rank+1
-                        if actor.state=="waiting" and rank>0 then
-                            -- 队列同时逐步前移，仍由跨门的真实路径完成登乘；不瞬移/虚增人数。
-                            local target=door.clear+door.forward*(door.queueDirection*math.floor(rank/3)*.75)
-                                +door.right*(door.side*(rank%3)*.65)
-                            local delta=target-actor.position
-                            local distance=delta:Length()
-                            local moved=math.min(distance,dt*actor.speed)
-                            actor.walking=moved>.0001
-                            if actor.walking then
-                                actor.position=actor.position+delta*(moved/distance)
-                                actor.yaw=math.deg(math.atan(delta.x,delta.z))
-                                actor.walkDistance=actor.walkDistance+moved
-                            end
-                        end
-                    end
-                end
-            end
-        end
+        local preceding={} ---@type table<number,number>
+        -- 所有候车人都沿自己的连续路径推进，不再先执行旧队列前移；
+        -- 否则换车重绑/旧档waiting会在同一步消费两次步行预算。
         for _, actor in ipairs(actors_) do
             if actor.kind==kind and not actor.completed and actor.doorId>0 then
                 local door=stop.plan.doors[actor.doorId]
-                if door and not occupied[door.id] then
-                    occupied[door.id]=true
+                if door then
                     if actor.state=="waiting" then
                         if kind=="alighting" then path(actor,{door.position,door.edge,door.clear},"alighting")
                         else path(actor,{door.clear,door.edge,door.position,door.inside},"walking_to_door") end
                     end
-                    -- 每门每模拟步最多服务一人，逐个遍历路径点。
-                    -- 只有实际走完门边、门槛及车内入口才能完成，不能靠固定等候时间计数。
-                    if walk(actor,dt) then
+                    local remaining=remainingPath(actor)
+                    local ahead=preceding[door.id]
+                    local allowed=dt*actor.speed
+                    if ahead then allowed=math.min(allowed,math.max(0,remaining-ahead-DOOR_FOLLOW_DISTANCE)) end
+                    -- 同门多人可连续走动，但不能追越前人或跳过任何门槛路径点。
+                    -- 步长来自真实速度和余距，帧率、暂停或存档恢复都不会直接增加人数。
+                    local finished=walk(actor,allowed/actor.speed)
+                    preceding[door.id]=remainingPath(actor)
+                    if finished then
                         actor.completed=true
                         if kind=="alighting" then
                             stop.alighted,alightedTotal_=stop.alighted+1,alightedTotal_+1
@@ -629,19 +681,45 @@ function PassengerService.ExportState()
         terminal=stop.terminal,reversing=stop.reversing,destinations=stop.destinations,boarded=stop.boarded,
         alighted=stop.alighted,totalBoarding=stop.totalBoarding,totalAlighting=stop.totalAlighting,
         closeTimer=stop.closeTimer,completionTaken=stop.completionTaken} or nil
-    return {actors=people,onboard=riders,stop=savedStop,nextId=nextId_,visits=visit_,boarded=boardedTotal_,
+    return {topologyMode=RailNetwork.GetTopologyMode(),geometryMode=Route.GetGeometryMode(),actors=people,onboard=riders,stop=savedStop,nextId=nextId_,visits=visit_,boarded=boardedTotal_,
         alighted=alightedTotal_,comfort=comfort_,comfortPenalty=comfortPenalty_,lastSpeed=lastSpeed_}
 end
 function PassengerService.RestoreState(data)
     assert(type(data)=="table" and type(data.actors)=="table" and type(data.onboard)=="table","客流存档不完整")
     assert(#data.onboard<=PassengerService.GetCapacity() and #data.actors<=1300,"客流存档超出容量")
+    assert(data.topologyMode==nil or data.topologyMode==RailNetwork.GetTopologyMode(),"客流拓扑未知，拒绝覆盖原进度")
+    assert(data.geometryMode==nil or data.geometryMode==Route.GetGeometryMode(),"客流线路几何模式未知，拒绝覆盖原进度")
+    local legacy=data.topologyMode==nil
+    local legacyGeometry=data.geometryMode==nil
+    local function migrate(position)
+        local current=legacyGeometry and Route.TransformLegacyPosition(position) or position
+        if not legacy then return current end
+        local s=Route.ProjectApprox(current)
+        local base=Route.Sample(s)
+        local right=Route.RightAt(s)
+        local lat=(current-base):DotProduct(right)
+        -- 老档正岛台迁移到负侧；高架出站路线同步迁移，不镜像站房/全城。
+        if lat>0 and lat<12.5 then
+            local nextLat=Train.IsReversing() and math.max(7.1,math.min(13.4,lat+5)) or -lat
+            return current+right*(nextLat-lat)
+        end
+        return current
+    end
     PassengerService.Reset()
     local byId={} ---@type table<number,RailwayPassenger>
     for _,saved in ipairs(data.actors) do
-        local actor=unpackPerson(saved);actors_[#actors_+1]=actor;byId[actor.id]=actor
+        local actor=unpackPerson(saved)
+        actor.position=migrate(actor.position)
+        for i,target in ipairs(actor.targets) do actor.targets[i]=migrate(target) end
+        actors_[#actors_+1]=actor;byId[actor.id]=actor
     end
     for _,saved in ipairs(data.onboard) do
-        local rider=byId[saved.id] or unpackPerson(saved)
+        local rider=byId[saved.id]
+        if not rider then
+            rider=unpackPerson(saved)
+            rider.position=migrate(rider.position)
+            for i,target in ipairs(rider.targets) do rider.targets[i]=migrate(target) end
+        end
         onboard_[#onboard_+1]=rider
     end
     nextId_,visit_=data.nextId,data.visits
@@ -657,6 +735,58 @@ function PassengerService.RestoreState(data)
             alighted=saved.alighted,totalBoarding=saved.totalBoarding,totalAlighting=saved.totalAlighting,
             closeTimer=saved.closeTimer,plan=plan,signature=signature(),completionTaken=saved.completionTaken==true}
         assert(saved.boarded<=saved.totalBoarding and saved.alighted<=saved.totalAlighting,"乘降进度无效")
+        if legacy then
+            ---@class LegacyPassengerDoorPath
+            ---@field id number
+            ---@field position number[]
+            ---@field targets number[][]
+            local savedById={} ---@type table<string,LegacyPassengerDoorPath>
+            for _,item in ipairs(data.actors) do savedById[tostring(item.id)]=item end
+            for _,actor in ipairs(actors_) do
+                local old=savedById[tostring(actor.id)] --[[@as LegacyPassengerDoorPath?]]
+                if old and not actor.completed and actor.state~="leaving" and actor.state~="gone" then
+                    -- 旧reverse档可能仍在旧正线/侧线，单纯平移或clamp世界横距会把
+                    -- 门内锚留在台上。保留身份/完成计数，只将未完成跨门段按实际
+                    -- 门计划重绑定；段内进度由旧相邻目标的投影比例迁移。
+                    local door=plan.doors[actor.doorId]
+                    if not door then
+                        door=nearestDoor(actor,plan.doors,{})
+                    end
+                    actor.doorId=door.id
+                    if actor.state=="walking_to_door" or actor.state=="alighting" then
+                        local targets=actor.kind=="alighting" and {door.position,door.edge,door.clear}
+                            or {door.clear,door.edge,door.position,door.inside}
+                        local index=math.max(1,math.min(#targets,actor.targetIndex))
+                        ---@param v number[]
+                        ---@return Vector3
+                        local function oldPoint(v)
+                            local px,py,pz=assert(v[1]),assert(v[2]),assert(v[3])
+                            local p=Vector3(px,py,pz)
+                            return legacyGeometry and Route.TransformLegacyPosition(p) or p
+                        end
+                        if index>1 and old.targets[index-1] and old.targets[index] then
+                            local from,to=oldPoint(old.targets[index-1]),oldPoint(old.targets[index])
+                            local delta=to-from
+                            local lengthSquared=delta:LengthSquared()
+                            local progress=lengthSquared>.000001 and math.max(0,math.min(1,
+                                (oldPoint(old.position)-from):DotProduct(delta)/lengthSquared)) or 0
+                            local start=assert(targets[index-1])
+                            actor.position=start+(assert(targets[index])-start)*progress
+                        elseif actor.kind=="alighting" and old.targets[1] and old.targets[2] then
+                            local oldDoor,oldEdge=oldPoint(old.targets[1]),oldPoint(old.targets[2])
+                            local outward=oldEdge-oldDoor
+                            if outward:LengthSquared()>.000001 then
+                                local oldInside=oldDoor-outward:Normalized()*.75
+                                local delta=oldDoor-oldInside
+                                local progress=math.max(0,math.min(1,(oldPoint(old.position)-oldInside):DotProduct(delta)/delta:LengthSquared()))
+                                actor.position=door.inside+(door.position-door.inside)*progress
+                            end
+                        end
+                        actor.targets,actor.targetIndex,actor.walking=targets,index,true
+                    end
+                end
+            end
+        end
     end
     PassengerService.UpdateVisuals(0)
 end

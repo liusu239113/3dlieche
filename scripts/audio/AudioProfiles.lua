@@ -1,5 +1,6 @@
 -- 六个幻想声音档案。内部车型 ID 固定，玩家名称依次为沧羽/赤峦/苍穹/雷隼/流萤/星澜。
 -- 每款独立怠速脉冲、牵引泛音、轮轨/风声色彩与混音；频率不是现实车型录音标识。
+-- 音频文件路径与响度由下方 PATHS 统一装配，表内的声学参数供离线合成器使用。
 ---@class FantasyAudioProfile
 ---@field id string
 ---@field name string
@@ -23,6 +24,7 @@
 ---@field runningPath? string
 ---@field idlePath? string
 ---@field hornPath string
+---@field brakePath? string
 ---@field hornGain number
 ---@field hornNotes number[]
 ---@field description string
@@ -39,7 +41,7 @@ Profiles.Trains = {
         railHz = 3, railColour = .74, windColour = .44,
         idleGain = .34, tractionGain = .49, rollingGain = .36, windGain = .25,
         speedScale = 130, throttleNotches = 8,
-        hornPath = "audio/sfx/fantasy/horn_d12.mp3", hornGain = .64, hornNotes = { 196, 294, 392 },
+        hornNotes = { 196, 294, 392 },
         description = "低沉脉冲机组，圆润牵引泛音，厚实轮轨",
     },
     DF4D = {
@@ -49,7 +51,7 @@ Profiles.Trains = {
         railHz = 4, railColour = .80, windColour = .53,
         idleGain = .39, tractionGain = .55, rollingGain = .40, windGain = .26,
         speedScale = 145, throttleNotches = 8,
-        hornPath = "audio/sfx/fantasy/horn_d18.mp3", hornGain = .35, hornNotes = { 164, 246, 328 },
+        hornNotes = { 164, 246, 328 },
         description = "不对称重脉冲机组，粗粝牵引与密集轮轨节奏",
     },
     SS9G = {
@@ -59,7 +61,7 @@ Profiles.Trains = {
         railHz = 3.5, railColour = .67, windColour = .40,
         idleGain = .23, tractionGain = .46, rollingGain = .32, windGain = .27,
         speedScale = 170, throttleNotches = 8,
-        hornPath = "audio/sfx/fantasy/horn_e21.mp3", hornGain = .34, hornNotes = { 247, 370, 494 },
+        hornNotes = { 247, 370, 494 },
         description = "温和辅助电气嗡鸣，清晰阶次牵引和中频滚动",
     },
     HXD3D = {
@@ -69,7 +71,7 @@ Profiles.Trains = {
         railHz = 4.5, railColour = .61, windColour = .35,
         idleGain = .26, tractionGain = .51, rollingGain = .37, windGain = .29,
         speedScale = 180, throttleNotches = 8,
-        hornPath = "audio/sfx/fantasy/horn_e32.mp3", hornGain = .34, hornNotes = { 220, 330, 440 },
+        hornNotes = { 220, 330, 440 },
         description = "深辅机底音，带周期相位调制的锐利逆变牵引",
     },
     CRH380A = {
@@ -79,7 +81,7 @@ Profiles.Trains = {
         railHz = 5, railColour = .53, windColour = .27,
         idleGain = .18, tractionGain = .37, rollingGain = .27, windGain = .36,
         speedScale = 330, throttleNotches = 8,
-        hornPath = "audio/sfx/fantasy/horn_m30.mp3", hornGain = .65, hornNotes = { 330, 495, 660 },
+        hornNotes = { 330, 495, 660 },
         description = "轻柔通风怠速，通透高频牵引，柔顺滚动与气流",
     },
     CR400AF = {
@@ -89,27 +91,30 @@ Profiles.Trains = {
         railHz = 5.5, railColour = .48, windColour = .22,
         idleGain = .20, tractionGain = .39, rollingGain = .29, windGain = .39,
         speedScale = 350, throttleNotches = 8,
-        hornPath = "audio/sfx/fantasy/horn_m35.mp3", hornGain = .67, hornNotes = { 294, 441, 588 },
+        hornNotes = { 294, 441, 588 },
         description = "平滑辅机，明亮多阶牵引，细密轮轨与宽频气流",
     },
 }
 
 -- 所有播放资源均是生成后经低通、峰值与响度处理的音效。
 local PATHS = {
-    blue_white = {"audio/sfx/comfort/rail_d12_running_warm.wav", "audio/sfx/comfort/comfort_horn_d12.wav"},
-    DF4D = {"audio/sfx/comfort/rail_d18_running_warm.wav", "audio/sfx/comfort/comfort_horn_d18.wav"},
-    SS9G = {"audio/sfx/comfort/rail_e21_running_warm.wav", "audio/sfx/comfort/comfort_horn_e21.wav"},
-    HXD3D = {"audio/sfx/comfort/rail_e32_running_warm.wav", "audio/sfx/comfort/comfort_horn_e32.wav"},
-    CRH380A = {"audio/sfx/comfort/rail_m30_running_warm.wav", "audio/sfx/comfort/comfort_horn_m30.wav"},
-    CR400AF = {"audio/sfx/comfort/rail_m35_running_warm.wav", "audio/sfx/comfort/comfort_horn_m35.wav"},
+    blue_white = {"rail_d12", .68},
+    DF4D = {"rail_d18", .66},
+    SS9G = {"rail_e21", .64},
+    HXD3D = {"rail_e32", .66},
+    CRH380A = {"rail_m30", .70},
+    CR400AF = {"rail_m35", .72},
 }
 for _, id in ipairs(Profiles.Ids) do
     local profile = Profiles.Trains[id]
-    profile.runningPath, profile.hornPath = PATHS[id][1], PATHS[id][2]
-    profile.idlePath = profile.powerType == "diesel"
-        and "audio/sfx/comfort/rail_diesel_idle_warm.wav" or "audio/sfx/comfort/rail_electric_idle_warm.wav"
-    profile.hornGain = .55
-    profile.description = "生成写实循环 · 柔和辅机与独立轮轨声"
+    local stem, hornGain = table.unpack(PATHS[id])
+    local short = string.sub(stem, 6)
+    profile.runningPath = "audio/sfx/comfort/" .. stem .. "_running_warm.wav"
+    profile.idlePath = "audio/sfx/comfort/" .. stem .. "_idle_warm.wav"
+    profile.hornPath = "audio/sfx/comfort/comfort_horn_" .. short .. ".wav"
+    profile.brakePath = "audio/sfx/comfort/comfort_brake_" .. short .. ".wav"
+    profile.hornGain = hornGain
+    profile.description = "生成专属循环 · 独立机组/牵引/轮轨/气流音色"
 end
 ---@type table<string, string>
 local aliases = {}

@@ -54,8 +54,12 @@ function Panels.Operations(rows, onToggle)
         variant = "secondary", paddingHorizontal = 3, onClick = onToggle }
     -- 四个44px操作行+三处4px间距+上下4px内边距=196px。
     -- 显式自然高度/no-shrink，避免受窄滚动视口的Yoga内容约束压缩。
-    for _, row in ipairs(rows) do row:SetStyle({ height = 44, minHeight = 44, flexShrink = 0 }) end
-    local contentHeight = #rows * 44 + math.max(0, #rows - 1) * 4 + 8
+    local contentHeight = math.max(0, #rows - 1) * 4 + 8
+    for _, row in ipairs(rows) do
+        local height=math.max(44,tonumber(row.props.minHeight) or 44)
+        row:SetStyle({height=height,minHeight=height,flexShrink=0})
+        contentHeight=contentHeight+height
+    end
     local body = UI.ScrollView { id = "operationsDetails", width = "100%", height = 196, visible = false,
         minHeight = 52, flexShrink = 0,
         scrollX = false, scrollY = true, bounces = false, showScrollbar = true,

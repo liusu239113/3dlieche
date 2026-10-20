@@ -11,9 +11,12 @@ local C = Skin.Colors
 ---@field description string 编组与车型介绍，由 Train 提供
 ---@field maxSpeedKmh number 仅保留目录信息，不当作线路限速显示
 ---@field ready boolean
+---@field readinessMessage? string
 
 ---@class CabTrainSelectorCallbacks
----@field onSelect? fun(id: string): boolean, string?
+---@field onSelect? fun(id: string, done: fun(success:boolean,message?:string)): boolean, string? true仅表示受理，done才表示实际装配结束。
+---@field onCancel? fun(id:string) 取消当前请求；下载可以继续缓存，但不得再提交旧意图。
+---@field getCatalog? fun():CabTrainCatalogEntry[] 打开时刷新真实目录，不加载车型。
 ---@field onOpen? fun(open: boolean)
 
 ---@class CabTrainCardRefs
@@ -43,6 +46,9 @@ local C = Skin.Colors
 ---@field pendingId_ string
 ---@field open_ boolean
 ---@field busy_ boolean
+---@field requestId_ string
+---@field requestGeneration_ integer
+---@field loadingRatio_ number
 ---@field speed_ number
 ---@field limit_ number
 local Selector = UI.Panel:Extend("CabTrainSelector")
@@ -65,6 +71,7 @@ function Selector:Init(props)
     self.catalog_, self.rows_, self.callbacks_ = {}, {}, {}
     self.selectedId_, self.selectedName_, self.pendingId_ = "", "待同步车型", ""
     self.open_, self.busy_ = false, false
+    self.requestId_, self.requestGeneration_, self.loadingRatio_ = "", 0, 0
     self.speed_, self.limit_ = 0, 80
     self.page_, self.pageSize_ = 1, 2
 
@@ -128,6 +135,15 @@ function Selector:FindTrain(id)
     return nil
 end
 
+--- 内部加载ID只能用于路由，缺少展示名时不给玩家直接显示真实车型ID。
+---@param id string
+---@param name string?
+---@return string
+local function displayName(id, name)
+    if type(name) ~= "string" or name == "" or name:lower() == id:lower() then return "车队车辆" end
+    return name
+end
+
 --- 复制目录，避免写回 Train 的表；重复或空 ID 不创建可选卡片。
 ---@param catalog CabTrainCatalogEntry[]?
 function Selector:SetCatalog(catalog)
@@ -137,16 +153,17 @@ function Selector:SetCatalog(catalog)
         if type(entry.id) == "string" and entry.id ~= "" and not seen[entry.id] then
             seen[entry.id] = true
             copy[#copy + 1] = {
-                id = entry.id, name = entry.name or "未命名车队车辆", kind = entry.kind or "待补充",
+                id = entry.id, name = displayName(entry.id,entry.name), kind = entry.kind or "待补充",
                 description = entry.description or "车型与编组介绍待补充。",
                 maxSpeedKmh = entry.maxSpeedKmh or 0, ready = entry.ready == true,
+                readinessMessage = entry.readinessMessage,
             }
         end
     end
     self.catalog_ = copy
     self.page_ = math.min(self.page_, self:GetPageCount())
     local pending = self:FindTrain(self.pendingId_)
-    if not pending or not pending.ready then self.pendingId_ = "" end
+    if not self.busy_ and (not pending or not pending.ready) then self.pendingId_ = "" end
     self:BuildCards()
     self:Refresh()
 end
@@ -218,8 +235,11 @@ end
 ---@param id string
 ---@param name string
 function Selector:SetSelected(id, name)
-    self.selectedId_, self.selectedName_ = id or "", name or "待同步车型"
-    if self.pendingId_ == self.selectedId_ then self.pendingId_ = "" end
+    self.selectedId_ = id or ""
+    local entry = self:FindTrain(self.selectedId_)
+    self.selectedName_ = entry and entry.name or displayName(self.selectedId_,name)
+    -- 每帧HUD仍会同步旧车型；不能把这当作新请求的完成/取消信号。
+    if not self.busy_ and self.pendingId_ == self.selectedId_ then self.pendingId_ = "" end
     self.current_:SetText("当前：" .. self.selectedName_)
     self:Refresh()
 end
@@ -235,23 +255,28 @@ end
 
 function Selector:Refresh()
     local stopped = math.abs(self.speed_) <= 0.1
-    self.notice_:SetText((stopped and "已停车，可确认换车。" or "请先停车，再确认换车。")
+    self.notice_:SetText((self.busy_ and "正在准备新编组，可取消；原列车仍保留。"
+        or (stopped and "已停车，可确认换车。" or "请先停车，再确认换车。"))
         .. "当前线路限速 " .. math.floor(self.limit_ + 0.5) .. " km/h。")
     for _, entry in ipairs(self.catalog_) do
         local row = self.rows_[entry.id]
         if row then
             local current = entry.id == self.selectedId_
             local pending = entry.id == self.pendingId_
+            local loading = self.busy_ and entry.id == self.requestId_
             row.panel:SetStyle({ borderColor = pending and C.teal or C.edge })
             row.name:SetFontColor(entry.ready and C.text or C.muted)
-            row.status:SetText(not entry.ready and "资源未就绪，暂不可选"
-                or (current and "当前驾驶车型" or (pending and "待确认车型" or "可选，确认后按需加载")))
+            row.status:SetText(loading and "正在准备新编组，旧列车仍保留"
+                or (not entry.ready and (entry.readinessMessage or "资源未就绪，暂不可选")
+                    or (current and "当前驾驶车型" or (pending and "待确认车型"
+                        or (entry.readinessMessage or "可选，确认后按需加载")))))
             row.status:SetFontColor(not entry.ready and C.orange or (pending and C.teal or C.secondary))
-            row.button:SetText(current and "当前" or (pending and "已选" or "选择"))
+            row.button:SetText(loading and "待切换" or (current and "当前" or (pending and "已选" or "选择")))
             row.button:SetDisabled(not entry.ready or current or self.busy_)
         end
     end
     local pending = self:FindTrain(self.pendingId_)
+    self.confirm_:SetText(self.busy_ and "正在准备…" or "确认换车")
     self.confirm_:SetDisabled(self.busy_ or not stopped or not self.callbacks_.onSelect
         or not pending or not pending.ready or pending.id == self.selectedId_)
 end
@@ -282,18 +307,69 @@ function Selector:Confirm()
         self.feedback_:SetFontColor(C.orange)
         return
     end
-    self.busy_ = true
+    self.busy_, self.requestId_ = true, entry.id
+    self.requestGeneration_ = self.requestGeneration_ + 1
+    local generation = self.requestGeneration_
+    self:SetLoading(0,"正在准备" .. entry.name .. "，可取消；原列车仍保留。")
     self:Refresh()
-    local ok, success, message = pcall(callback, entry.id)
-    self.busy_ = false
-    if ok and success == true then
-        self:Close()
-    else
-        self.feedback_:SetText(ok and (message or "换车未成功，请重试。") or "换车失败，请重试。")
+    local function done(success, message)
+        if generation ~= self.requestGeneration_ or not self.busy_ then return end
+        self.busy_, self.requestId_ = false, ""
+        if success == true then
+            -- 只有拥有实际装配结果的main调用done，回调true返回本身绝不算完成。
+            self:SetSelected(entry.id,entry.name)
+            self:Close()
+        else
+            self.feedback_:SetText(message or "换车未成功，原列车已保留，可重试。")
+            self.feedback_:SetFontColor(C.orange)
+            self:RefreshCatalog()
+        end
+        self:Refresh()
+    end
+    local ok, accepted, message = pcall(callback, entry.id, done)
+    if not ok then
+        print("[Hud] 换车回调异常：" .. tostring(accepted))
+        self:CancelRequest()
+        self.feedback_:SetText("换车请求异常，已取消，请重试。")
         self.feedback_:SetFontColor(C.orange)
-        if not ok then print("[Hud] 换车回调异常：" .. tostring(success)) end
+    elseif accepted ~= true then
+        done(false,message or "换车请求未受理，请重试。")
     end
     self:Refresh()
+end
+
+--- 更新等待提示；进度100%不等于实际装配完成，仍须done结果。
+---@param ratio number
+---@param text? string
+function Selector:SetLoading(ratio, text)
+    if not self.busy_ then return end
+    self.loadingRatio_ = math.max(0,math.min(1,ratio or 0))
+    self.feedback_:SetText(text or string.format("正在准备新编组 %d%%；原列车仍保留，可取消。",
+        math.floor(self.loadingRatio_*100+.5)))
+    self.feedback_:SetFontColor(C.teal)
+end
+
+--- 先失效本地令牌，再通知入口，避免取消回调同步触发旧done。
+function Selector:CancelRequest()
+    if not self.busy_ then return end
+    local id = self.requestId_
+    self.requestGeneration_ = self.requestGeneration_ + 1
+    self.busy_,self.requestId_ = false,""
+    if self.callbacks_.onCancel then
+        local ok, message = pcall(self.callbacks_.onCancel,id)
+        if not ok then print("[Hud] 取消换车回调异常：" .. tostring(message)) end
+    end
+end
+
+---@return boolean
+function Selector:RefreshCatalog()
+    local callback = self.callbacks_.getCatalog
+    if not callback then return true end -- 兼容显式SetCatalog的离线使用方。
+    local ok, catalog = pcall(callback)
+    if ok and type(catalog) == "table" then self:SetCatalog(catalog); return true end
+    self:SetCatalog({}) -- 查询失败不能继续显示上次缓存的ready=true。
+    print("[Hud] 刷新车型目录失败：" .. tostring(catalog))
+    return false
 end
 
 --- 采用 HUD 已计算的安全区/胶囊边距，所有数值为 UI 基准像素。
@@ -327,8 +403,10 @@ function Selector:Open()
     if self.open_ then return end
     self.pendingId_ = ""
     self.page_ = 1
+    local catalogOK = self:RefreshCatalog()
     self:BuildCards()
-    self.feedback_:SetText(self.callbacks_.onSelect and "选择车型后点击确认。" or "换车回调未接入。")
+    self.feedback_:SetText(not catalogOK and "目录刷新失败，请关闭后重试。"
+        or (self.callbacks_.onSelect and "选择车型后点击确认。" or "换车回调未接入。"))
     self.feedback_:SetFontColor(C.secondary)
     self.open_ = true
     self:Show()
@@ -338,6 +416,7 @@ function Selector:Open()
 end
 
 function Selector:Close()
+    self:CancelRequest()
     if not self.open_ then return end
     self.open_, self.pendingId_ = false, ""
     UI.PopOverlay(self)
@@ -345,8 +424,15 @@ function Selector:Close()
     if self.callbacks_.onOpen then self.callbacks_.onOpen(false) end
 end
 
+function Selector:Destroy()
+    self:Close()
+    UI.Panel.Destroy(self)
+end
+
 ---@return boolean
 function Selector:IsOpen() return self.open_ end
+---@return boolean
+function Selector:IsBusy() return self.busy_ end
 
 ---@param dt number
 function Selector:Update(dt)

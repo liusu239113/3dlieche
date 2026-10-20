@@ -1,6 +1,7 @@
 -- 独立生成的架空通用驾驶舱；主体、内衬和弧形控制台来自真实 MDL。
 -- 六车共用标准舱，不宣称各车型的厂家专用内舱；动态显示/操纵件独立绑定。
 local FictionalWorld = require "config.FictionalWorld"
+local CabVisualConfig = require "config.CabVisualConfig"
 local CabInterior = {}
 local CAB_MASK, FLOOR = 8, -1.43
 local CAB_MODEL = "model/ce4bf974f7cf4f0fb34b735ae52cfc1c/Meshes/ce4bf974f7cf4f0fb34b735ae52cfc1c.mdl"
@@ -16,11 +17,8 @@ local boundLead_=nil
 local speedText_=nil
 ---@type Text3D?
 local controlText_=nil
----@type Node?
-local tractionLever_=nil
----@type Node?
-local brakeLever_=nil
 local selectedId_,kind_,visible_,timer_="","diesel",false,0
+local visual_=CabVisualConfig.Get(nil)
 local offset_=Vector3.ZERO
 ---@type Material[]
 local materials_={}
@@ -147,60 +145,46 @@ local function buildSeat(root,x,z)
 end
 
 ---@param root Node
----@param name string
----@param position Vector3
----@param dark Material
----@param metal Material
----@param grip Material
----@return Node
-local function lever(root,name,position,dark,metal,grip)
-    detail(root,name.."底座",position,Vector3(.13,.032,.24),dark)
-    local pivot=root:CreateChild(name)
-    pivot.position=position+Vector3(0,.025,0)
-    detail(pivot,"活动金属柄",Vector3(0,.09,0),Vector3(.022,.18,.022),metal,true)
-    detail(pivot,"圆角握柄",Vector3(0,.19,0),Vector3(.072,.066,.115),grip)
-    return pivot
-end
-
----@param root Node
 local function buildControls(root)
     buildBody(root)
     buildSeat(root,-.62,-1.65)
     buildSeat(root,.65,-1.65)
     local dark=material(Color(.03,.043,.05),.04,.8)
     local metal=material(Color(.47,.50,.53),.72,.4)
-    local traction=material(Color(.17,.39,.42),0,.7)
-    local brake=material(Color(.58,.12,.07),0,.7)
-    local screen=material(Color(.008,.025,.028),0,1,true)
+    local traction=material(visual_.accent,0,visual_.plastic)
+    local brake=material(visual_.warning,0,visual_.plastic)
+    local screen=material(Color(visual_.screen.r*.035,visual_.screen.g*.035,visual_.screen.b*.035),0,1,true)
     -- 贴在生成控制台的独立屏面上，不新造第二张桌子；文字为实时世界实体。
     local left=root:CreateChild("LiveSpeedDisplay")
     left.position=Vector3(-.62,-.48,-.09)
     left.rotation=Quaternion(-35,Vector3.UP)*Quaternion(55,Vector3.RIGHT)
-    detail(left,"显示面",Vector3.ZERO,Vector3(.34,.17,.012),screen)
-    speedText_=text(left,"速度数字",Vector3(0,.021,-.009),"000 km/h",.040,Color(.48,.91,.84))
-    text(left,"速度说明",Vector3(0,-.044,-.009),"实际速度",.018,Color(.58,.71,.71))
+    detail(left,"显示面",Vector3.ZERO,Vector3(.48,.22,.012),screen)
+    speedText_=text(left,"速度数字",Vector3(0,.021,-.009),"000 km/h",.048,visual_.screen)
+    text(left,"速度说明",Vector3(0,-.060,-.009),"实际速度",.018,Color(.58,.71,.71))
     local right=root:CreateChild("LiveControlDisplay")
     right.position=Vector3(.61,-.48,-.09)
     right.rotation=Quaternion(35,Vector3.UP)*Quaternion(55,Vector3.RIGHT)
-    detail(right,"显示面",Vector3.ZERO,Vector3(.34,.17,.012),screen)
-    controlText_=text(right,"牵引制动数字",Vector3(0,0,-.009),"牵引 0\n制动 0%",.027,Color(.77,.87,.84))
-    tractionLever_=lever(root,"牵引操纵杆",Vector3(-.88,-.42,-.23),dark,metal,traction)
-    brakeLever_=lever(root,"制动操纵杆",Vector3(-.23,-.56,-.15),dark,metal,brake)
+    detail(right,"显示面",Vector3.ZERO,Vector3(.48,.22,.012),screen)
+    controlText_=text(right,"牵引制动数字",Vector3(0,0,-.009),"牵引 0\n制动 0%",.031,visual_.screen)
+    -- 保留真实舱体的仪表和驾驶台，不再叠加中央方盒、状态盒或程序化操纵杆。
+    -- 这些附加几何会挡住参考图中的前窗视野，运行控制仍由 HUD 完成。
     text(root,"架空车型铭牌",Vector3(.65,-.90,-.39),FictionalWorld.trainNames[selectedId_] or FictionalWorld.trainNames.blue_white,.028,Color(.70,.75,.74))
     local lamp=root:CreateChild("CabLight")
     lamp.position=Vector3(0,.62,-.65)
     local light=lamp:CreateComponent("Light")
-    light.lightType,light.color=LIGHT_POINT,Color(.87,.93,1)
+    light.lightType,light.color=LIGHT_POINT,visual_.cabinLight
     light.range,light.brightness,light.castShadows,light.lightMask=4.0,2.5,false,CAB_MASK
 end
 
 -- 场景根独立于旧车辆：换车先释放车体也不会留下失效子节点引用。
 function CabInterior.Dispose()
-    speedText_,controlText_,tractionLever_,brakeLever_=nil,nil,nil,nil
+    speedText_,controlText_=nil,nil
     if root_ then root_:Dispose();root_=nil end
     for _,mat in ipairs(materials_) do mat:Dispose() end
     materials_={}
     boundLead_,scene_,selectedId_,visible_,timer_=nil,nil,"",false,0
+    offset_=Vector3.ZERO
+    visual_=CabVisualConfig.Get(nil)
 end
 
 ---@param scene Scene
@@ -212,6 +196,7 @@ function CabInterior.Ensure(scene,lead,selectedId,cabOffset)
     CabInterior.Dispose()
     scene_,boundLead_,selectedId_,offset_=scene,lead,selectedId,cabOffset
     kind_=KINDS[selectedId] or "diesel"
+    visual_=CabVisualConfig.Get(selectedId)
     root_=scene:CreateChild("GeneratedCab_"..selectedId)
     root_.enabled=false
     local ok,message=xpcall(function() buildControls(assert(root_)) end,debug.traceback)
@@ -263,8 +248,6 @@ function CabInterior.Update(lead,dt,speedKmh,throttle,maxThrottle,brake,reversin
     local controlValue=string.format("牵引 %d\n制动 %d%%%s",math.floor(throttle),math.floor(Clamp(brake,0,1)*100+.5),reversing and " 倒" or "")
     if speedText_ and speedText_.text~=speedValue then speedText_.text=speedValue end
     if controlText_ and controlText_.text~=controlValue then controlText_.text=controlValue end
-    if tractionLever_ then tractionLever_.rotation=Quaternion(-28+56*Clamp(throttle/math.max(1,maxThrottle),0,1),Vector3.RIGHT) end
-    if brakeLever_ then brakeLever_.rotation=Quaternion(-24+48*Clamp(brake,0,1),Vector3.RIGHT) end
 end
 
 return CabInterior

@@ -3,6 +3,7 @@
 -- Traffic依赖Train/Route/RailNetwork，不反向依赖Game；本模块只消费其权威状态。
 -- ============================================================================
 local GameConfig = require "config.GameConfig"
+local GameModes = require "config.GameModes"
 local Route = require "world.Route"
 local RailNetwork = require "world.RailNetwork"
 local Train = require "train.Train"
@@ -11,6 +12,8 @@ local Hud = require "ui.Hud"
 local AudioManager = require "audio.AudioManager"
 local SpeedPolicy = require "game.SpeedPolicy"
 local PassengerService = require "game.PassengerService"
+local Environment = require "world.Environment"
+local Timetable = require "game.Timetable"
 
 local Game = {}
 local G = GameConfig.Gameplay
@@ -21,7 +24,7 @@ local STATE = { DRIVING = "driving", DWELL = "dwell", TERMINAL = "terminal" }
 ---@field description string
 ---@type RailwayService[]
 local SERVICES = {
-    {id = "local", name = "站站停", description = "依次停靠五站，终到后手动换向折返"},
+    {id = "local", name = "站站停", description = "依次停靠沿线各站，终到后手动换向折返"},
     {id = "express", name = "快速大站停", description = "停首站、中间枢纽与总站；其余车站限速通过"},
     {id = "passing", name = "侧线待避训练", description = "站站停；中间枢纽侧线停稳，待快车通过、信号放行"},
 }
@@ -53,6 +56,58 @@ local tripCompleted_ = false
 local tripHadTravel_ = false
 local lastPassengerPhase_ = ""
 local initialDistance_ = 0.0
+---@type number?
+local departureBlockedSince_ = nil
+local lastDepartureReason_ = ""
+---@type RailwayTimetable?
+local timetable_ = nil
+local timetableCache_ = {} ---@type table
+local timetableCacheKey_ = ""
+local timetableCacheElapsed_ = -math.huge
+local timetableCacheMinutes_,timetableCacheS_ = -math.huge,-math.huge
+
+---@return TimetableOptions
+local function timetableOptions()
+    local segments={}
+    for _,segment in ipairs(Route.GetSegments()) do
+        segments[#segments+1]={s=segment.s,length=segment.length,radius=segment.radius,type=segment.type}
+    end
+    return {s=Train.GetS(),reversing=Train.IsReversing(),service=SERVICES[serviceIndex_].id,
+        journeyId=journeyId_,originIndex=state_~=STATE.DRIVING and lastArrival_ and lastArrival_.index or nil,
+        operatingKmh=Train.GetOperatingSpeedKmh(),lineKmh=G.SpeedLimitKmh,stationKmh=G.StationSpeedKmh,
+        deceleration=Train.GetServiceDeceleration(true),segments=segments,closed=Route.IsClosed(),length=Route.GetLength()}
+end
+
+local function replanTimetable()
+    if timetable_ then
+        timetable_:SyncClock(Environment.GetClock())
+        timetable_:Replan(timetableOptions())
+        timetableCacheKey_=""
+    end
+end
+
+---@return TimetableMotion
+local function timetableMotion()
+    local passenger=PassengerService.GetStatus()
+    local departure=Game.GetDepartureStatus()
+    return {s=Train.GetS(),speedMs=Train.GetSpeedMs(),operatingKmh=Train.GetOperatingSpeedKmh(),
+        deceleration=Train.GetServiceDeceleration(true),dwelling=state_~=STATE.DRIVING,terminal=state_==STATE.TERMINAL,
+        gameOver=state_=="game_over",minimumDwellSeconds=dwellTimer_,passengerReady=passenger.ready,
+        departureBlocked=departure.blocked,departureReason=departure.reason}
+end
+
+---@class GameDepartureStatus
+---@field blocked boolean
+---@field reason string
+---@field message string
+---@field waitSeconds number simulated seconds, paused with the game
+---@field signalReason string?
+---@field blockerName string?
+---@field blockerDistance number?
+---@field stationIndex number?
+---@field aspect string?
+---@field passingPhase string?
+---@field dwellRemaining number
 
 ---@return RailwayService
 local function service() return (assert(SERVICES[serviceIndex_])) end
@@ -197,11 +252,12 @@ function Game.Setup()
     journeyId_, completedTrips_, rewardedStops_, passengerPoints_ = 1, 0, 0, 0
     tripCompleted_, tripHadTravel_, lastPassengerPhase_ = false, false, ""
     initialDistance_ = Train.GetDistanceTravelled()
+    departureBlockedSince_,lastDepartureReason_ = nil,""
     PassengerService.Reset()
     Traffic.SetService(service().id)
     local bestDist = selectNext()
     -- 生产入口从 firstStation.s+1 开始。初始站真实登乘，不作为到站发经验。
-    if stopped() then
+    if stopped() and not GameModes.IsRage() then
         for _, station in ipairs(stations_) do
             if Route.Distance(Train.GetS(),station.s) < G.StopTolerance then
                 lastArrival_, arrivalReversing_, nextIndex_ = station, Train.IsReversing(), station.index
@@ -217,6 +273,12 @@ function Game.Setup()
         end
     end
 
+    if GameModes.IsRage() then
+        Train.SetBrake(0)
+        Hud.Toast("狂暴试验场：不限速、不侧翻 · Q/E提前选道，交会与撞击触发连锁",5)
+    end
+    timetable_ = Timetable.new(Environment.GetClock(),stations_,timetableOptions())
+    timetableCacheKey_=""
     local marks = {}
     for _, station in ipairs(stations_) do
         local pos = Route.Sample(station.s)
@@ -242,9 +304,43 @@ function Game.Init() Game.Setup() end
 -- ============================================================================
 -- 固定模拟步更新：安全判定每步，HUD最多常规10Hz，操作/状态变化强制刷新。
 -- ============================================================================
+-- 狂暴的车站是可高速穿越的实验路标，不搬用普通客运开门/红灯联锁。
+-- 玩家改变道岔与到达时间，Traffic负责从真实车流碰撞产生后续事件。
+local function updateRage(dt)
+    elapsed_=elapsed_+dt
+    hudTimer_=hudTimer_+dt
+    local reversing=Train.IsReversing()
+    if reversing~=travelReversing_ then
+        travelReversing_=reversing
+        rewarded_={}
+        journeyId_=journeyId_+1
+        selectNext()
+    end
+    local station=stations_[nextIndex_ or 0]
+    if station then
+        local passed=reversing and Train.GetS()<=station.s or (not reversing and Train.GetS()>=station.s)
+        if passed then
+            if not rewarded_[station.index] then
+                rewarded_[station.index]=true
+                rewardedStops_,xp_=rewardedStops_+1,xp_+100
+                Hud.Toast(station.name.."试验路标通过 · 继续选道，观察混合车流的连锁变化",2.5)
+                print(string.format("[Game] 狂暴路标 %s，方向%d，位置%.1f",station.name,reversing and -1 or 1,Train.GetS()))
+            end
+            lastArrival_=station
+            nextIndex_=followingStop(station.index,reversing)
+            hudDirty_=true
+        end
+    end
+    if not station and stopped() then hudDirty_=true end
+    state_=STATE.DRIVING
+    if hudDirty_ or hudTimer_>=.1 then Game.UpdateHud(hudTimer_) end
+end
+
 ---@param dt number
 function Game.Update(dt)
     if dt<=0 or PassengerService.IsPaused() then return end
+    if GameModes.IsRage() then updateRage(dt);return end
+    if timetable_ then timetable_:SyncClock(Environment.GetClock()) end
     local accident=Train.GetAccidentStatus()
     if accident.active then
         if state_~="game_over" then
@@ -265,7 +361,14 @@ function Game.Update(dt)
         elseif lastArrival_ and state_ ~= STATE.TERMINAL then
             PassengerService.SetDestinations(destinations(lastArrival_.index,reversing),reversing)
         end
+        if reversing and service().id=="passing" then
+            -- 上行没有穿越岛台的侧线；折返沿上行正常站停，不能调度逆股快车。
+            serviceIndex_=1
+            Traffic.SetService("local")
+            Hud.Toast("上行折返使用左行正线；侧线待避训练仅下行可用",3)
+        end
         passingPrepared_, passingApproachPrepared_ = false, false
+        if state_~=STATE.TERMINAL then replanTimetable() end
         hudDirty_ = true
     end
     tripHadTravel_ = tripHadTravel_ or Train.GetDistanceTravelled()-initialDistance_ > G.StopTolerance*2
@@ -286,6 +389,7 @@ function Game.Update(dt)
                     passingSawRed_, passingComplete_ = false, false
                     passingPrepared_, passingApproachPrepared_ = false, false
                     state_, dwellTimer_, nextIndex_ = STATE.DWELL,G.DwellTime,lastArrival_.index
+                    replanTimetable()
                     Traffic.SetService(service().id)
                     preparePassing(false)
                     Train.EmergencyBrake()
@@ -318,6 +422,17 @@ function Game.Update(dt)
         Game.CheckArrival()
     end
     Game.EnforceDepartureInterlock()
+    local departure = Game.GetDepartureStatus()
+    if departure.blocked and state_ == STATE.DWELL then
+        if not departureBlockedSince_ then departureBlockedSince_ = elapsed_ end
+    else departureBlockedSince_ = nil end
+    if departure.reason ~= lastDepartureReason_ then
+        lastDepartureReason_ = departure.reason
+        print(string.format("[Game] 离站条件 %s：%s（等待%.1fs，阻塞%s）",departure.reason,departure.message,
+            departure.waitSeconds,departure.blockerName or "无"))
+        hudDirty_ = true
+    end
+    if timetable_ then timetable_:Observe(timetableMotion()) end
     Game.CheckSpeedLimit()
     local notch = Train.GetThrottle()
     if notch ~= lastNotch_ then lastNotch_, hudDirty_ = notch, true end
@@ -362,6 +477,10 @@ function Game.Arrive(station, errorDist)
     local target = stations_[nextIndex_ or 0]
     if not target or target.index ~= station.index then return end
     state_, dwellTimer_, lastArrival_ = STATE.DWELL, G.DwellTime, station
+    if timetable_ then
+        timetable_:SyncClock(Environment.GetClock())
+        timetable_:Arrive(station.index,false,Train.GetS())
+    end
     arrivalReversing_, arrivalError_, initialService_, needsCorrection_ = Train.IsReversing(),errorDist,false,false
     waitingNotified_, wrongLaneWarned_, clearanceWarned_ = false, false, false
     PassengerService.BeginStop(station,{initial=false,terminal=followingStop(station.index,arrivalReversing_)==nil,
@@ -380,35 +499,60 @@ function Game.Arrive(station, errorDist)
 end
 
 --- 客运准备好只是必要条件，还须同时满足信号、最低站停和终到约束。
----@return boolean, string
-function Game.CanDepart()
-    if Train.IsDerailed() then return false,"事故结束本局 · 请重开" end
+--- getter只读，不按调用次数推进等待；CanDepart和HUD消费同一个判定。
+---@return GameDepartureStatus
+function Game.GetDepartureStatus()
+    if GameModes.IsRage() then
+        return {blocked=false,reason="rage_free",message="狂暴自由驾驶 · 不限速 / 不侧翻 / 车门关闭",
+            waitSeconds=0,dwellRemaining=0} --[[@as GameDepartureStatus]]
+    end
+    local result = {blocked=false,reason="ready",message="乘降完成 · 车门关闭 · 发车条件满足",
+        waitSeconds=0,dwellRemaining=dwellTimer_,stationIndex=lastArrival_ and lastArrival_.index or nil}
+        --[[@as GameDepartureStatus]]
+    local function block(reason,message)
+        result.blocked,result.reason,result.message = true,reason,message
+        result.waitSeconds = departureBlockedSince_ and math.max(0,elapsed_-departureBlockedSince_) or 0
+        return result
+    end
+    if Train.IsDerailed() then return block("accident","事故结束本局 · 请重开") end
     local passenger = PassengerService.GetStatus()
-    if not passenger.ready then return false, passenger.message end
-    if state_ == STATE.TERMINAL then return false,"终到全部下车 · 请停稳手动换向，再完成折返登乘" end
+    if not passenger.ready then return block("passengers",passenger.message) end
+    if state_ == STATE.TERMINAL then return block("terminal","终到全部下车 · 请停稳手动换向，再完成折返登乘") end
     if state_ == STATE.DWELL then
-        if not lastArrival_ then return false,"无有效停靠站" end
-        if needsCorrection_ then return false,"侧线整列净空不足 · 未完成客运队列保留" end
-        if math.abs(Train.GetSpeedMs()) > .02 then return false,"请先停稳完成乘降" end
-        if dwellTimer_ > 0 then return false,"车门已关闭 · 最低站停剩余 "..math.ceil(dwellTimer_).." 秒" end
-        if followingStop(lastArrival_.index,arrivalReversing_) == nil then return false,"终到 · 全部下车后手动换向折返" end
+        if not lastArrival_ then return block("no_route","无有效停靠站") end
+        if needsCorrection_ then return block("siding_clearance","侧线整列净空不足 · 未完成客运队列保留") end
+        if math.abs(Train.GetSpeedMs()) > .02 then return block("not_stopped","请先停稳完成乘降") end
+        if dwellTimer_ > 0 then return block("minimum_dwell","车门已关闭 · 最低站停剩余 "..math.ceil(dwellTimer_).." 秒") end
+        if followingStop(lastArrival_.index,arrivalReversing_) == nil then return block("terminal","终到 · 全部下车后手动换向折返") end
     end
     local arrival = lastArrival_
     -- 只在停站状态检查发车信号；区间信号只提示，不抢玩家牵引与制动。
     if arrival and state_ == STATE.DWELL then
-        if isPassingStop(arrival) and not passingClearance(arrival) then return false,"侧线整列未清空咽喉" end
-        if not signalOpen(arrival.index) then return false,"发车信号未开放 · 请继续停稳等待" end
-        if isPassingStop(arrival) and not passingComplete_ and not passingSawRed_ then
-            return false,"侧线待避 · 仍须经历红灯，等待快车通过"
+        if isPassingStop(arrival) and not passingClearance(arrival) then return block("siding_clearance","侧线整列未清空咽喉") end
+        local signal = Traffic.GetDepartureStatus(arrival.index)
+        result.signalReason,result.blockerName,result.blockerDistance = signal.signalReason,signal.blockerName,signal.blockerDistance
+        result.aspect,result.passingPhase = signal.aspect,signal.passingPhase
+        if signal.blocked then return block(signal.reason,signal.message.." · 请继续停稳等待") end
+        if isPassingStop(arrival) and signal.passingPhase == "cancelled" then
+            result.reason,result.message = "passing_cancelled","待避班次未发出，本次训练取消；实际进路开放，可离站"
+        elseif isPassingStop(arrival) and not passingComplete_ and not passingSawRed_ then
+            return block("passing_clearance","侧线待避 · 仍须经历红灯，等待快车通过")
         end
     end
-    return true,"乘降完成 · 车门关闭 · 发车条件满足"
+    return result
+end
+
+---@return boolean, string
+function Game.CanDepart()
+    local status = Game.GetDepartureStatus()
+    return not status.blocked,status.message
 end
 
 --- 必须在每个生产 Train.Update 前立即调用，不能只在更新后拦截。
 --- 不改 Train，不仅信任 Game.ThrottleUp：直接 Train.SetThrottle 同样强制收油制动。
 ---@return boolean, string
 function Game.EnforceDepartureInterlock()
+    if GameModes.IsRage() then return true,"狂暴自由驾驶" end
     if Train.IsDerailed() then return false,"事故结束本局" end
     PassengerService.RefreshDoorPlan()
     local allowed, message = Game.CanDepart()
@@ -438,8 +582,10 @@ function Game.Depart()
         nextStop = nextIndex_
         if not nextStop then return end
     end
-    local permitted = signalOpen(lastArrival_.index)
-    local passingReady = not isPassingStop(lastArrival_) or (passingSawRed_ and permitted)
+    local signal = Traffic.GetDepartureStatus(lastArrival_.index)
+    local permitted = not signal.blocked
+    local passingCancelled = signal.passingPhase == "cancelled"
+    local passingReady = not isPassingStop(lastArrival_) or passingCancelled or (passingSawRed_ and permitted)
     if not permitted or not passingReady then
         Train.EmergencyBrake()
         if not waitingNotified_ then
@@ -450,9 +596,12 @@ function Game.Depart()
         end
         return
     end
-    if isPassingStop(lastArrival_) then
+    if isPassingStop(lastArrival_) and not passingCancelled then
         passingComplete_ = true
         print("[Game] "..lastArrival_.name.."侧线待避完成：停稳经历红灯，快车通过后信号放行")
+    elseif isPassingStop(lastArrival_) then
+        Hud.Toast("本次待避班次无法安全发出，训练已取消；按实际开放进路离站，不计待避完成",4)
+        print("[Game] 待避班次未发出：本次训练取消，未标完成；真实发车进路开放")
     end
     local allowed = Game.CanDepart()
     if not allowed then Train.EmergencyBrake(); return end
@@ -472,12 +621,13 @@ end
 -- 限速：车型/线路/曲线/站场/必停站/物理终端与Traffic信号占用取最小值。
 -- ============================================================================
 function Game.GetSpeedLimit()
+    if GameModes.IsRage() then return 1e9,"不限速" end
     local station = stations_[nextIndex_ or 0]
     local limit, reason = SpeedPolicy.Calculate({
         s = Train.GetS(), length = Route.GetLength(), closed = Route.IsClosed(),
         activeLength = Train.GetActiveLength(),
         operatingKmh = Train.GetOperatingSpeedKmh(), lineKmh = G.SpeedLimitKmh,
-        deceleration = Train.GetServiceDeceleration(), reversing = Train.IsReversing(),
+        deceleration = Train.GetServiceDeceleration(true), reversing = Train.IsReversing(),
         segments = Route.GetSegments(), stations = stations_,
         nextStopS = station and station.s or nil, dwelling = state_ ~= STATE.DRIVING,
         stationKmh = G.StationSpeedKmh, reactionSeconds = G.BrakeReactionSeconds,
@@ -490,6 +640,7 @@ function Game.GetSpeedLimit()
 end
 
 function Game.CheckSpeedLimit()
+    if GameModes.IsRage() then return end
     local speed = math.abs(Train.GetSpeedKmh())
     local limit, reason = Game.GetSpeedLimit()
     if speed > limit + 5 then
@@ -503,7 +654,7 @@ function Game.CheckSpeedLimit()
     if station and state_ == STATE.DRIVING then
         local distance = distanceAhead(station.s)
         local velocity = speed / 3.6
-        local brakingDistance = velocity * velocity / (2 * math.max(0.1, Train.GetServiceDeceleration()))
+        local brakingDistance = velocity * velocity / (2 * math.max(0.1, Train.GetServiceDeceleration(true)))
             + velocity * G.BrakeReactionSeconds + 100
         if distance ~= math.huge and speed > 30 and distance <= brakingDistance and not brakeWarned_ then
             brakeWarned_ = true
@@ -518,7 +669,9 @@ end
 -- ============================================================================
 ---@param dt number
 function Game.UpdateHud(dt)
-    PassengerService.RefreshDoorPlan()
+    if not GameModes.IsRage() then PassengerService.RefreshDoorPlan() end
+    Hud.SetGameMode(GameModes.GetId())
+    if GameModes.IsRage() then Hud.SetRageStats(Traffic.GetRageStats()) end
     local station = stations_[nextIndex_ or 0]
     if state_=="game_over" then
         Hud.SetStationName("本局结束")
@@ -529,7 +682,10 @@ function Game.UpdateHud(dt)
     elseif station then
         Hud.SetStationName(station.name)
         local distance = distanceAhead(station.s)
-        if state_ == STATE.DWELL then Hud.SetNextStation("停靠中")
+        if GameModes.IsRage() then
+            Hud.SetNextStation(distance>1000 and string.format("路标 %.1f km",distance/1000)
+                or string.format("路标 %d m",math.floor(distance)))
+        elseif state_ == STATE.DWELL then Hud.SetNextStation("停靠中")
         elseif distance == math.huge then Hud.SetNextStation("已越站·换向修正")
         elseif distance > 1000 then Hud.SetNextStation(string.format("%.1f km", distance / 1000))
         else Hud.SetNextStation(string.format("%d m", math.floor(distance))) end
@@ -557,6 +713,7 @@ function Game.UpdateHud(dt)
     Hud.SetRailwayStatus(railwayStatus)
     Hud.SetServiceName(Game.GetServiceName())
     Hud.SetPassengerStatus(Game.GetPassengerStatus())
+    Hud.SetTimetable(Game.GetTimetableStatus())
     Hud.Update(dt)
     local pos = Route.Sample(Train.GetS())
     local active = state_ == STATE.DWELL and nextIndex_ or nil
@@ -614,6 +771,7 @@ function Game.SetSwitch(dir)
 end
 ---@return boolean, string
 function Game.ToggleDrivingMode()
+    if GameModes.IsRage() then return false,"狂暴模式使用独立街机牵引；普通模式可选休闲/模拟驾驶" end
     if Train.IsDerailed() then return false,"事故结束本局 · 请重开" end
     if not stopped() then
         local message = "请先收油停稳，再切换驾驶模式"
@@ -631,6 +789,7 @@ end
 ---@param id string
 ---@return boolean, string
 function Game.SetService(id)
+    if GameModes.IsRage() then return false,"狂暴试验场为自由驾驶，不启用客运任务" end
     if Train.IsDerailed() then return false,"事故结束本局 · 请重开" end
     if not stopped() then
         local message = "请先收油停稳，再选择运营任务"
@@ -640,6 +799,7 @@ function Game.SetService(id)
     local selected = nil ---@type integer?
     for i, item in ipairs(SERVICES) do if item.id == id then selected = i; break end end
     if not selected then return false, "未知运营任务：" .. tostring(id) end
+    if id=="passing" and Train.IsReversing() then return false,"侧线待避仅下行可用，上行不能横穿双线岛台" end
     if selected == serviceIndex_ then return true, service().id end
     serviceIndex_ = selected
     passingSawRed_, passingComplete_, passingPrepared_, passingApproachPrepared_ = false, false, false, false
@@ -655,6 +815,7 @@ function Game.SetService(id)
     if arrival and state_ ~= STATE.TERMINAL then
         PassengerService.SetDestinations(destinations(arrival.index),Train.IsReversing())
     end
+    replanTimetable()
     Hud.Toast("任务：" .. service().name .. "；" .. service().description, 4)
     preparePassing(false)
     Game.UpdateHud(0)
@@ -676,8 +837,14 @@ function Game.GetServices()
 end
 function Game.GetService() return service().id end
 function Game.GetServiceId() return service().id end
-function Game.GetServiceName() return service().name end
+function Game.GetServiceName() return GameModes.IsRage() and "狂暴试验场" or service().name end
 function Game.GetObjective()
+    if GameModes.IsRage() then
+        if not Route.IsClosed() and (Train.GetS()<=Train.GetActiveLength()+21 or Train.GetS()>=Route.GetLength()-21) then
+            return "轨道尽头安全缓冲 · 收油停稳后按 R 换向，继续连锁试验"
+        end
+        return "Q/E提前选道 → 改变交会 → 撞击传播；车流互动涌现不同连锁，不限速、不侧翻"
+    end
     if Train.IsDerailed() then return "脱轨事故 · 本局结束，重开旅程后恢复运营" end
     if state_ == STATE.TERMINAL then
         return (lastArrival_ and lastArrival_.name or "线路") .. "终到；停稳手动换向折返"
@@ -685,6 +852,10 @@ function Game.GetObjective()
     local station = stations_[nextIndex_ or 0]
     local arrival = lastArrival_
     if state_ == STATE.DWELL and arrival and isPassingStop(arrival) then
+        local departure = Game.GetDepartureStatus()
+        if departure.passingPhase == "cancelled" then
+            return "本次待避班次未发出，训练取消；"..(departure.blocked and departure.message or "按实际开放进路离站")
+        end
         if not passingSawRed_ or not signalOpen(arrival.index) then
             return arrival.name.."侧线待避：保持停稳，等快车通过、信号放行"
         end
@@ -703,11 +874,20 @@ function Game.GetObjective()
 end
 function Game.GetPassengerStatus()
     local status = PassengerService.GetStatus()
+    if GameModes.IsRage() then
+        status.ready,status.doorsOpen,status.dwellRemaining=true,false,0
+        status.message="封闭试验场 · 空载自由驾驶 / 无强制站停"
+        return status
+    end
     local allowed, message = Game.CanDepart()
     status.ready = allowed
     if not allowed then status.message = message end
     status.dwellRemaining = dwellTimer_
     return status
+end
+function Game.GetAnnouncementState()
+    return {state=state_,nextIndex=nextIndex_,lastArrival=lastArrival_ and lastArrival_.index or nil,
+        initialService=initialService_,service=service().id,journeyId=journeyId_}
 end
 function Game.GetOperatingStats()
     local passengers = PassengerService.GetStats()
@@ -728,18 +908,72 @@ function Game.GetNearestStationDistance()
     for _, station in ipairs(stations_) do best = math.min(best, Route.Distance(Train.GetS(), station.s)) end
     return best
 end
+--- Display prediction uses a copied model so a read/HUD refresh cannot advance or rewrite plans.
+function Game.GetTimetableStatus()
+    if GameModes.IsRage() then return nil end
+    if not timetable_ then return nil end
+    local clock=Environment.GetClock()
+    local departure=Game.GetDepartureStatus()
+    local key=table.concat({state_,serviceIndex_,journeyId_,tostring(Train.IsReversing()),Train.GetSelectedId(),
+        clock.revision,tostring(clock.running),tostring(clock.paused),departure.reason,
+        tostring(nextIndex_),tostring(lastArrival_ and lastArrival_.index),tostring(PassengerService.IsReady())},"|")
+    if key~=timetableCacheKey_ or elapsed_-timetableCacheElapsed_>=1
+        or math.abs(clock.minutes-timetableCacheMinutes_)>=1 or math.abs(Train.GetS()-timetableCacheS_)>250 then
+        timetableCache_=timetable_:Preview(clock,timetableMotion())
+        timetableCacheKey_,timetableCacheElapsed_=key,elapsed_
+        timetableCacheMinutes_,timetableCacheS_=clock.minutes,Train.GetS()
+    end
+    return timetableCache_
+end
+function Game.ValidateTimetableState(data)
+    if type(data)~="table" then return false,"运营存档不是对象" end
+    return Timetable.ValidateSnapshot(data.timetable)
+end
 function Game.ExportState()
+    if timetable_ then timetable_:SyncClock(Environment.GetClock()) end
     local rewarded={}
     for index,value in pairs(rewarded_) do if value then rewarded[#rewarded+1]=index end end
-    return {serviceIndex=serviceIndex_,state=state_,nextIndex=nextIndex_,dwellTimer=dwellTimer_,elapsed=elapsed_,xp=xp_,
+    return {mode=GameModes.GetId(),rageStats=GameModes.IsRage() and Traffic.ExportRageState() or nil,
+        serviceIndex=serviceIndex_,state=state_,nextIndex=nextIndex_,dwellTimer=dwellTimer_,elapsed=elapsed_,xp=xp_,
         travelReversing=travelReversing_,lastArrival=lastArrival_ and lastArrival_.index or nil,
         arrivalReversing=arrivalReversing_,rewarded=rewarded,passingSawRed=passingSawRed_,passingComplete=passingComplete_,
         passingPrepared=passingPrepared_,passingApproachPrepared=passingApproachPrepared_,arrivalError=arrivalError_,
         initialService=initialService_,needsCorrection=needsCorrection_,journeyId=journeyId_,completedTrips=completedTrips_,
         rewardedStops=rewardedStops_,passengerPoints=passengerPoints_,tripCompleted=tripCompleted_,tripHadTravel=tripHadTravel_,
-        initialDistance=initialDistance_}
+        initialDistance=initialDistance_,timetable=not GameModes.IsRage() and timetable_ and timetable_:Export() or nil}
 end
+-- 地图版本迁移只接续累计值，不恢复旧坐标、站序奖励或旧线路时刻表。
+---@param data table?
+function Game.RestoreRouteProgress(data)
+    if type(data)~="table" then return false end
+    local function count(value)
+        local n=tonumber(value) or 0
+        return n==n and n<math.huge and math.max(0,math.floor(n)) or 0
+    end
+    xp_,elapsed_=count(data.xp),count(data.elapsed)
+    completedTrips_,rewardedStops_=count(data.completedTrips),count(data.rewardedStops)
+    passengerPoints_=count(data.passengerPoints)
+    if GameModes.IsRage() and data.rageStats then
+        assert(Traffic.RestoreRageState(data.rageStats),"旧狂暴累计成绩无效，原档保留")
+    end
+    hudDirty_=true
+    print(string.format("[Game] 新地图接续累计 XP=%d / 驾驶秒=%d；旧站序与进路不套用",xp_,elapsed_))
+    return true
+end
+
+-- 兼容既有狂暴迁移与验收入口，新普通线路使用同一累计值迁移规则。
+function Game.RestoreMountainProgress(data)
+    return GameModes.IsRage() and Game.RestoreRouteProgress(data) or false
+end
+
 function Game.RestoreState(data)
+    assert(type(data)=="table" and (data.mode or "normal")==GameModes.GetId(),"运营存档模式与地图不一致")
+    local validTimetable,message=Game.ValidateTimetableState(data)
+    assert(validTimetable,message)
+    if data.timetable then
+        local matches,reason=Timetable.Validate(data.timetable,stations_)
+        assert(matches,reason)
+    end
     assert(type(data)=="table" and type(data.rewarded)=="table","运营存档不完整")
     assert(data.state==STATE.DRIVING or data.state==STATE.DWELL or data.state==STATE.TERMINAL or data.state=="game_over","运营状态无效")
     assert(SERVICES[data.serviceIndex] and data.xp>=0 and data.elapsed>=0,"运营数值无效")
@@ -754,7 +988,21 @@ function Game.RestoreState(data)
     arrivalError_,initialService_,needsCorrection_=data.arrivalError,data.initialService,data.needsCorrection
     journeyId_,completedTrips_,rewardedStops_,passengerPoints_=data.journeyId,data.completedTrips,data.rewardedStops,data.passengerPoints
     tripCompleted_,tripHadTravel_,initialDistance_=data.tripCompleted,data.tripHadTravel,data.initialDistance
+    timetable_=Timetable.new(Environment.GetClock(),stations_,timetableOptions())
+    timetableCacheKey_=""
+    if data.timetable then
+        assert(timetable_:Restore(data.timetable))
+        timetable_:SyncClock(Environment.GetClock())
+    else
+        timetable_.migrated=true
+        timetable_.notice="旧档接续 · 从当前世界时刻编排，历史实际未记录"
+    end
+    departureBlockedSince_,lastDepartureReason_ = nil,""
     Traffic.SetService(service().id)
+    if GameModes.IsRage() then
+        assert(Traffic.RestoreRageState(data.rageStats))
+        state_,dwellTimer_=STATE.DRIVING,0
+    end
     hudDirty_=true
     Game.EnforceDepartureInterlock()
     Game.UpdateHud(0)
